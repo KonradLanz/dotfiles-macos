@@ -16,6 +16,12 @@
 #   ⚠️  0 Zeilen = NICHT leer — sondern History liegt noch im RAM!
 #   ⇒ Dieses Script liest mit fc -ln direkt aus dem RAM (Quelle 1)
 #   ⇒ Session-Check ist informativ; fc -ln rettet RAM-History immer
+#
+# AppleScript fc -W (Schritt 1.5):
+#   Schickt fc -W an alle idle Terminal.app Tabs (busy=false).
+#   Tabs mit laufendem Prozess werden übersprungen (kein Chaos in stdin).
+#   Funktioniert nur mit Terminal.app — für iTerm2 etc. manuell fc -W eingeben.
+#   Benötigt Accessibility-Rechte (Einstellungen > Datenschutz > Bedienungshilfen).
 # =============================================================================
 
 # WICHTIG: HISTFILE MUSS vor set -u gesetzt sein, sonst crash bei -u Flag
@@ -27,7 +33,7 @@ else
   _HISTFILE="${_HISTFILE_DEFAULT}"
 fi
 
-# Jetzt erst set -euo pipefail — HISTFILE ist nun sicher
+# Jetzt erst set -eo pipefail — HISTFILE ist nun sicher
 set -eo pipefail
 # Kein -u hier — zu viele zsh-interne Variablen können ungesetzt sein
 
@@ -92,10 +98,6 @@ else
     echo "   ║  ⚡ DIESES Terminal hat RAM-History (0 auf Disk)    ║"
     echo "   ║  → fc -ln liest sie direkt → NICHTS geht verloren  ║"
     echo "   ╚─────────────────────────────────────────────────────╝"
-    echo ""
-    echo "   ℹ️  Andere offene Terminals (falls welche offen sind):"
-    echo "      Dort 'fc -W' eingeben, dann hier Enter drücken."
-    echo "      Sonst geht deren RAM-History verloren."
   else
     echo "   ✓ Alle Sessions haben ihren RAM bereits auf Disk geschrieben"
   fi
@@ -103,6 +105,98 @@ else
   echo ""
   read "?   Enter zum Fortfahren: "
 fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCHRITT 1.5 — fc -W in alle anderen Terminal.app Tabs schicken (optional)
+# ─────────────────────────────────────────────────────────────────────────────
+# Schickt "fc -W" via AppleScript an alle idle Tabs (busy=false).
+# Tabs mit laufendem Prozess werden automatisch übersprungen.
+# Benötigt Accessibility-Rechte; bei Fehler: Warnung, kein Abbruch.
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "📲 SCHRITT 1.5 — fc -W in andere Terminal.app Tabs schicken"
+echo ""
+echo "   Soll fc -W via AppleScript an alle anderen idle Terminal.app"
+echo "   Fenster/Tabs geschickt werden? (Tabs mit laufendem Prozess"
+echo "   werden automatisch übersprungen.)"
+echo ""
+echo "   Voraussetzung: Terminal.app hat Accessibility-Rechte"
+echo "   (Einstellungen > Datenschutz > Bedienungshilfen)"
+echo ""
+read "APPLESCRIPT_RUN?   fc -W an alle anderen Tabs schicken? [J/n] "
+
+if [[ "${APPLESCRIPT_RUN}" != "n" && "${APPLESCRIPT_RUN}" != "N" ]]; then
+  echo ""
+  echo "   → Sende fc -W an alle idle Terminal.app Tabs..."
+
+  # AppleScript: iteriert über alle Fenster und alle Tabs darin.
+  # busy=true  → Prozess läuft (vim, ssh, etc.) → überspringen
+  # busy=false → Shell wartet auf Input (idle) → fc -W schicken
+  APPLESCRIPT_RESULT=$(osascript 2>&1 << 'APPLESCRIPT_EOF'
+    set sent_count to 0
+    set skipped_count to 0
+    set error_msg to ""
+
+    try
+      tell application "Terminal"
+        repeat with w in windows
+          repeat with t in tabs of w
+            try
+              if busy of t is false then
+                do script "fc -W" in t
+                set sent_count to sent_count + 1
+              else
+                set skipped_count to skipped_count + 1
+              end if
+            on error e
+              set skipped_count to skipped_count + 1
+            end try
+          end repeat
+        end repeat
+      end tell
+    on error e
+      set error_msg to e
+    end try
+
+    if error_msg is not "" then
+      return "ERROR:" & error_msg
+    else
+      return "OK:" & sent_count & ":" & skipped_count
+    end if
+APPLESCRIPT_EOF
+  )
+
+  if [[ "${APPLESCRIPT_RESULT}" == ERROR:* ]]; then
+    echo "   ⚠️  AppleScript Fehler: ${APPLESCRIPT_RESULT#ERROR:}"
+    echo "   ⚠️  Accessibility-Rechte prüfen:"
+    echo "      Einstellungen > Datenschutz > Bedienungshilfen > Terminal.app ✓"
+    echo "   → Weiter ohne automatisches fc -W (manuell in anderen Tabs eingeben)"
+  else
+    SENT="${APPLESCRIPT_RESULT#OK:}"
+    SENT_N="${SENT%%:*}"
+    SKIPPED_N="${SENT##*:}"
+    echo "   ✓ fc -W gesendet an ${SENT_N} Tab(s)"
+    [[ "${SKIPPED_N}" -gt 0 ]] && \
+      echo "   ℹ️  ${SKIPPED_N} Tab(s) übersprungen (laufender Prozess)"
+    echo ""
+
+    if [[ "${SENT_N}" -gt 0 ]]; then
+      echo "   ⏳ Kurz warten damit fc -W abgeschlossen wird..."
+      sleep 2
+      echo "   ✓ Bereit"
+    fi
+  fi
+
+  # Im Dry-Run: Meldung dass fc -W trotzdem ausgeführt wurde
+  # (fc -W ist schreibend aber akzeptabel im Dry-Run, da es nur
+  #  RAM auf Disk schreibt — kein Datenverlust möglich)
+  [[ "${DRY_RUN}" == 1 ]] && \
+    echo "   ℹ️  [DRY-RUN] fc -W wurde trotzdem ausgeführt (nur RAM→Disk, sicher)"
+else
+  echo "   → Übersprungen. Ggf. manuell 'fc -W' in anderen Terminals eingeben."
+fi
+
+echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 2 — Backup + Merge aller History-Quellen
@@ -128,7 +222,7 @@ echo "   → Merge aller History-Quellen..."
 # -ln = keine Nummern, sicher auch wenn HISTSIZE nicht gesetzt
 fc -ln 1 > "${MERGED_DUMP}" 2>/dev/null || true
 
-# Quelle 2: Alle Session-Files (andere Terminals, egal ob 0 oder N Zeilen)
+# Quelle 2: Alle Session-Files (andere Terminals, jetzt nach fc -W vollständig)
 for f in ~/.zsh_sessions/*.history(N) ~/.zsh_sessions/*.historynew(N); do
   if [[ -f "$f" && -s "$f" ]]; then
     grep -v '^[[:space:]]*$' "$f" \
