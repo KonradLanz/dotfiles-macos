@@ -7,31 +7,24 @@
 #   zsh ~/git/dotfiles-macos/history-cleanup/clean-history.sh --dry-run
 #   zsh ~/git/dotfiles-macos/history-cleanup/clean-history.sh --skip-extract
 #
-# Über macOS zsh-Sessions & das "0-Zeilen-Problem":
-#   ~/.zsh_sessions/*.historynew  = RAM-Buffer pro offenem Terminal
-#   fc -W noch NICHT ausgeführt   → Datei hat 0 Zeilen, History liegt im RAM
-#   fc -W ausgeführt              → Datei hat N Zeilen (RAM → Datei geschrieben)
-#   Terminal schließen            → wird automatisch in ~/.zsh_history gemerged
-#
-#   ⚠️  0 Zeilen = NICHT leer — sondern History liegt noch im RAM!
-#   ⇒ Dieses Script liest mit fc -ln direkt aus dem RAM (Quelle 1)
-#   ⇒ Session-Check ist informativ; fc -ln rettet RAM-History immer
-#
 # Format der .historynew Dateien (macOS Terminal.app):
-#   "   11  befehl"  — führende Leerzeichen + Nummer + 2 Leerzeichen + Befehl
-#   KEIN Timestamp-Format (kein ": 123456:0;befehl")
-#   → awk muss Nummer-Prefix ENTFERNEN, nicht die Zeile skippen!
+#   Plain-Zeilen ohne Timestamp.
+#   Frühere fc-l Dumps können Zeilennummern enthalten: "   11  befehl"
+#   Mehrzeiler aus copy-paste: Backslash am Zeilenende, Leerzeile = Block-Ende
+#   Mehrzeiler aus fc-l Dumps: literales \n als Trennzeichen
+#
+# Normalisierungs-Pipeline (Schritt 2b):
+#   1. trailing \n entfernen (vermeidet Leerzeilen nach Split)
+#   2. literales \n → echter Zeilenumbruch
+#   3. Zeilennummer-Prefix entfernen ("   11  " → "")
+#   4. zsh extended history Prefix entfernen (": 123:0;" → "")
+#   5. Backslash-Continuation Blöcke → auto in ~/scripts/ extrahieren
 #
 # AppleScript fc -W (Schritt 1.5):
 #   Schickt fc -W an alle idle Terminal.app Tabs (busy=false).
-#   Tabs mit laufendem Prozess werden übersprungen (kein Chaos in stdin).
-#   ⚠️  ALLE anderen Tabs müssen leere Eingabezeile haben (kein halbfertiger
-#       Befehl) — sonst wird fc -W direkt angehängt → fehlerhafter Befehl!
-#   Funktioniert nur mit Terminal.app — für iTerm2 etc. manuell fc -W eingeben.
 #   Benötigt Accessibility-Rechte (Einstellungen > Datenschutz > Bedienungshilfen).
 # =============================================================================
 
-# WICHTIG: HISTFILE MUSS vor set -u gesetzt sein, sonst crash bei -u Flag
 _HISTFILE_DEFAULT="${HOME}/.zsh_history"
 if [[ -n "${HISTFILE+x}" ]]; then
   _HISTFILE="${HISTFILE}"
@@ -47,6 +40,8 @@ BACKUP_DIR="${HOME}/.zsh_history_backups"
 SCRIPTS_DIR="${HOME}/scripts"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 MERGED_DUMP="/tmp/zsh_hist_merged_${TIMESTAMP}.txt"
+NORM_DUMP="/tmp/zsh_hist_norm_${TIMESTAMP}.txt"
+BLOCKS_FILE="/tmp/zsh_hist_blocks_${TIMESTAMP}.txt"
 CLEAN_FILE="/tmp/zsh_hist_clean_${TIMESTAMP}.txt"
 LONG_FILE="/tmp/zsh_hist_long_${TIMESTAMP}.txt"
 SECRET_FILE="/tmp/zsh_hist_secrets_${TIMESTAMP}.txt"
@@ -88,7 +83,7 @@ else
       echo "      → $(basename $f)  [⚡ 0 Zeilen auf Disk — History liegt im RAM]"
       HAS_RAM_SESSIONS=1
     else
-      echo "      → $(basename $f)  [$count Zeilen auf Disk — bereits mit fc -W geschrieben]"
+      echo "      → $(basename $f)  [$count Zeilen auf Disk]"
     fi
   done
   echo ""
@@ -173,7 +168,7 @@ APPLESCRIPT_EOF
     echo "   ⚠️  AppleScript Fehler: ${APPLESCRIPT_RESULT#ERROR:}"
     echo "   ⚠️  Accessibility-Rechte prüfen:"
     echo "      Einstellungen > Datenschutz > Bedienungshilfen > Terminal.app ✓"
-    echo "   → Weiter ohne automatisches fc -W (manuell in anderen Tabs eingeben)"
+    echo "   → Weiter ohne automatisches fc -W"
   else
     SENT="${APPLESCRIPT_RESULT#OK:}"
     SENT_N="${SENT%%:*}"
@@ -218,64 +213,207 @@ done
 
 echo "   → Merge aller History-Quellen..."
 
-# Quelle 1: In-Memory History dieses Terminals (fc -ln mit Nummern)
-# Format: "   11  befehl" — Nummern werden in Schritt 3/6 sauber entfernt
+# Quelle 1: In-Memory History dieses Terminals
 fc -ln 1 > "${MERGED_DUMP}" 2>/dev/null || true
 
-# Quelle 2: Alle Session-Files (nach fc -W vollständig auf Disk)
-# Format identisch: "   11  befehl"
+# Quelle 2: Session-Files
 for f in ~/.zsh_sessions/*.history(N) ~/.zsh_sessions/*.historynew(N); do
   if [[ -f "$f" && -s "$f" ]]; then
     cat "$f" >> "${MERGED_DUMP}" 2>/dev/null || true
   fi
 done
 
-# Quelle 3: Gespeicherte ~/.zsh_history
-# Format: entweder plain oder ": timestamp:0;befehl"
+# Quelle 3: ~/.zsh_history
 if [[ -f "${HISTFILE}" ]]; then
   cat "${HISTFILE}" >> "${MERGED_DUMP}" 2>/dev/null || true
 fi
 
 MERGED_COUNT=$(wc -l < "${MERGED_DUMP}" | tr -d ' ')
-echo "   ✓ Gesamt gesammelt: ${MERGED_COUNT} Zeilen (inkl. Duplikate + Nummern)"
+echo "   ✓ Gesamt gesammelt: ${MERGED_COUNT} Rohzeilen"
 
 if [[ "${MERGED_COUNT}" -eq 0 ]]; then
   echo ""
   echo "   ❌ FEHLER: Keine History-Daten gefunden!"
-  echo "      Stelle sicher dass du das Script im selben Terminal"
-  echo "      ausführst wo die History liegt, oder führe erst fc -W aus."
   exit 1
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCHRITT 2b — Normalisierung
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline:
+#   1. trailing \n entfernen  →  kein Leerzeilen-Artefakt nach Split
+#   2. literales \n → echter Zeilenumbruch
+#   3. Zeilennummer-Prefix ("   11  ") entfernen
+#   4. zsh extended history Prefix (": 123:0;") entfernen
+#   5. Leerzeilen weg
+# ─────────────────────────────────────────────────────────────────────────────
+echo "   → Normalisierung..."
+
+LC_ALL=C sed 's/\\n$//' "${MERGED_DUMP}" \
+  | LC_ALL=C sed 's/\\n/\n/g' \
+  | LC_ALL=C awk '
+    /^[[:space:]]*$/ { next }
+    /^[[:space:]]+[0-9]+[[:space:]]/ {
+      sub(/^[[:space:]]+[0-9]+[[:space:]]+/, "")
+      if ($0 == "") next
+    }
+    /^: [0-9]+:[0-9]+;/ {
+      sub(/^: [0-9]+:[0-9]+;/, "")
+      if ($0 == "") next
+    }
+    /^\[200~/ { next }
+    { print }
+  ' > "${NORM_DUMP}"
+
+NORM_COUNT=$(wc -l < "${NORM_DUMP}" | tr -d ' ')
+echo "   ✓ Normalisiert: ${NORM_COUNT} Zeilen"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCHRITT 2c — Backslash-Continuation Blöcke extrahieren
+# ─────────────────────────────────────────────────────────────────────────────
+# Blöcke erkennen: Zeile endet auf \ → sammeln bis Leerzeile oder Zeile ohne \
+# Blöcke → automatisch nach ~/scripts/ (mit abgeleitetem Namen)
+# Einzelzeilen → NORM_DUMP bereinigt (BLOCKS_FILE enthält nur plain Zeilen)
+# ─────────────────────────────────────────────────────────────────────────────
+echo "   → Blöcke erkennen..."
+mkdir -p "${SCRIPTS_DIR}"
+
+if [[ ! -d "${SCRIPTS_DIR}/.git" ]]; then
+  git -C "${SCRIPTS_DIR}" init -b main --quiet 2>/dev/null || \
+  git -C "${SCRIPTS_DIR}" init --quiet
+fi
+
+# Hilfsfunktion: Script-Name aus Block-Inhalt ableiten
+# Priorität: erste Kommentarzeile → erstes Wort → Timestamp-Fallback
+_derive_script_name() {
+  local block="$1"
+  local date_prefix=$(date +%Y%m%d)
+  local name=""
+
+  # Erste Kommentarzeile (# ...) suchen
+  name=$(echo "${block}" | grep '^#' | head -1 | sed 's/^#[[:space:]]*//' | tr ' ' '-' | tr -cd 'a-z0-9-' | cut -c1-30)
+
+  # Fallback: erstes Wort des ersten Befehls
+  if [[ -z "${name}" ]]; then
+    name=$(echo "${block}" | grep -v '^#' | head -1 | awk '{print $1}' | tr -cd 'a-z0-9_-' | cut -c1-20)
+  fi
+
+  # Fallback: generisch
+  [[ -z "${name}" ]] && name="script"
+
+  echo "${date_prefix}_${name}"
+}
+
+# Block-Verarbeitung mit awk — schreibt plain Zeilen nach BLOCKS_FILE
+# und gibt Blöcke als NUL-separierte Strings aus für Shell-Verarbeitung
+LC_ALL=C awk '
+/\\$/ {
+  sub(/\\$/, "")
+  block = (block == "") ? $0 : block "\n" $0
+  next
+}
+/^[[:space:]]*$/ {
+  if (block != "") { printf "%s\x00", block; block = "" }
+  next
+}
+{
+  if (block != "") { printf "%s\x00", block; block = "" }
+  print $0
+}
+END { if (block != "") printf "%s\x00", block }
+' "${NORM_DUMP}" > "${BLOCKS_FILE}.raw"
+
+# Plain Zeilen (keine Blöcke) extrahieren
+LC_ALL=C awk '
+/\\$/ {
+  sub(/\\$/, "")
+  block = (block == "") ? $0 : block "\n" $0
+  next
+}
+/^[[:space:]]*$/ {
+  if (block != "") { block = "" }
+  next
+}
+{
+  if (block != "") { block = ""; next }
+  print $0
+}
+' "${NORM_DUMP}" > "${BLOCKS_FILE}"
+
+BLOCK_COUNT=$(LC_ALL=C tr -cd '\0' < "${BLOCKS_FILE}.raw" | wc -c | tr -d ' ')
+PLAIN_COUNT=$(wc -l < "${BLOCKS_FILE}" | tr -d ' ')
+echo "   ✓ Blöcke erkannt: ${BLOCK_COUNT} (→ ~/scripts/)"
+echo "   ✓ Einzelzeilen:   ${PLAIN_COUNT}"
+
+if [[ "${BLOCK_COUNT}" -gt 0 && "${SKIP_EXTRACT}" == 0 ]]; then
+  echo ""
+  echo "📦 Blöcke werden automatisch nach ${SCRIPTS_DIR}/ extrahiert..."
+  echo ""
+
+  BLOCK_IDX=0
+  while IFS= read -r -d $'\0' BLOCK; do
+    BLOCK_IDX=$((BLOCK_IDX + 1))
+    SUGGESTED=$(_derive_script_name "${BLOCK}")
+    PREVIEW=$(echo "${BLOCK}" | head -3)
+
+    echo "   [$BLOCK_IDX/${BLOCK_COUNT}] Vorgeschlagener Name: ${SUGGESTED}"
+    echo "   Preview:"
+    echo "${PREVIEW}" | sed 's/^/     /'
+    echo ""
+
+    # Name prüfen: wenn nicht ableitbar (nur Datum + "script") → nachfragen
+    if [[ "${SUGGESTED}" == *"_script" && $(echo "${BLOCK}" | grep -c '^#') -eq 0 ]]; then
+      read "BNAME?   Name (Enter = ${SUGGESTED}, d = löschen, s = überspringen): "
+    else
+      read "BNAME?   Enter = ${SUGGESTED}, anderer Name, d = löschen, s = überspringen: "
+    fi
+
+    case "${BNAME}" in
+      d|D)
+        echo "   → Gelöscht (nicht extrahiert)"
+        continue
+        ;;
+      s|S)
+        echo "   → Übersprungen (bleibt in History)"
+        echo "${BLOCK}" >> "${BLOCKS_FILE}"
+        continue
+        ;;
+      "")
+        FINAL_NAME="${SUGGESTED}"
+        ;;
+      *)
+        FINAL_NAME="${BNAME}"
+        ;;
+    esac
+
+    [[ "${FINAL_NAME}" != *.sh ]] && FINAL_NAME="${FINAL_NAME}.sh"
+    [[ ! "${FINAL_NAME}" =~ ^[0-9]{8}_ ]] && FINAL_NAME="$(date +%Y%m%d)_${FINAL_NAME}"
+
+    SPATH="${SCRIPTS_DIR}/${FINAL_NAME}"
+
+    if [[ "${DRY_RUN}" == 1 ]]; then
+      echo "   [DRY-RUN] Würde speichern: ${SPATH}"
+    else
+      printf '#!/usr/bin/env zsh\n# Extracted: %s\n# From: zsh history cleanup\n# ---\n\n%s\n' \
+        "$(date '+%Y-%m-%d %H:%M')" "${BLOCK}" > "${SPATH}"
+      chmod +x "${SPATH}"
+      git -C "${SCRIPTS_DIR}" add "${FINAL_NAME}" 2>/dev/null || true
+      git -C "${SCRIPTS_DIR}" commit -m "extract: ${FINAL_NAME}" --quiet 2>/dev/null || true
+      echo "   ✓ Gespeichert + committed: ${SPATH}"
+    fi
+    echo ""
+  done < "${BLOCKS_FILE}.raw"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 3 — Lange Einträge finden
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX: Zeilennummer-Prefix ENTFERNEN statt Zeile skippen.
-# Formate die normalisiert werden:
-#   "   11  befehl"        → "befehl"   (fc -ln / .historynew Format)
-#   ": 1234567:0;befehl"   → "befehl"   (zsh extended history Format)
-# ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "📏 SCHRITT 3 — Lange Einträge analysieren (>${LONG_THRESH} Zeichen)"
 
 LC_ALL=C awk -v thresh="${LONG_THRESH}" '
-  /^[[:space:]]*$/  { next }
-  /^\[200~/         { next }
-
-  # fc -ln / .historynew Format: "   11  befehl" → Nummer entfernen
-  /^[[:space:]]+[0-9]+[[:space:]]/ {
-    sub(/^[[:space:]]+[0-9]+[[:space:]]+/, "")
-    if ($0 == "") next
-  }
-
-  # zsh extended history Format: ": 1234567:0;befehl" → Timestamp entfernen
-  /^: [0-9]+:[0-9]+;/ {
-    sub(/^: [0-9]+:[0-9]+;/, "")
-    if ($0 == "") next
-  }
-
   length($0) > thresh { print }
-' "${MERGED_DUMP}" | sort -u > "${LONG_FILE}"
+' "${BLOCKS_FILE}" | sort -u > "${LONG_FILE}"
 
 LONG_COUNT=$(wc -l < "${LONG_FILE}" | tr -d ' ')
 echo "   Gefunden: ${LONG_COUNT} lange Einträge (>${LONG_THRESH} Zeichen)"
@@ -286,7 +424,7 @@ echo "   Gefunden: ${LONG_COUNT} lange Einträge (>${LONG_THRESH} Zeichen)"
 echo ""
 echo "🔐 SCHRITT 4 — Secret-Erkennung"
 
-export MERGED_DUMP
+export BLOCKS_FILE
 python3 - << 'PYEOF' > "${SECRET_FILE}" 2>/dev/null
 import sys, math, re, os
 
@@ -306,20 +444,14 @@ SECRET_PATTERNS = [
     r'(?i)(aws_access_key|aws_secret)',
 ]
 
-# Normalisiere Zeile: entferne fc-ln Nummern und zsh-Timestamps
-def normalize(line):
-    line = re.sub(r'^\s+\d+\s+', '', line)
-    line = re.sub(r'^: \d+:\d+;', '', line)
-    return line.strip()
-
 try:
-    with open(os.environ.get('MERGED_DUMP', '/tmp/merged.txt')) as f:
+    with open(os.environ.get('BLOCKS_FILE', '/tmp/blocks.txt')) as f:
         lines = f.readlines()
 except:
     sys.exit(0)
 
 for line in lines:
-    line = normalize(line.rstrip())
+    line = line.rstrip()
     if not line or len(line) < 10: continue
     for pat in SECRET_PATTERNS:
         if re.search(pat, line):
@@ -355,11 +487,6 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${LONG_COUNT}" -gt 0 ]]; then
   echo "📝 SCHRITT 5 — Lange Einträge als Scripts speichern"
   mkdir -p "${SCRIPTS_DIR}"
 
-  if [[ ! -d "${SCRIPTS_DIR}/.git" ]]; then
-    git -C "${SCRIPTS_DIR}" init -b main --quiet 2>/dev/null || \
-    git -C "${SCRIPTS_DIR}" init --quiet
-  fi
-
   INDEX=0
   while IFS= read -r ENTRY; do
     INDEX=$((INDEX + 1))
@@ -385,10 +512,8 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${LONG_COUNT}" -gt 0 ]]; then
         printf '#!/usr/bin/env zsh\n# Extracted: %s\n# From: history cleanup\n# ---\n\n%s\n' \
           "$(date '+%Y-%m-%d %H:%M')" "${ENTRY}" > "${SPATH}"
         chmod +x "${SPATH}"
-        if [[ -d "${SCRIPTS_DIR}/.git" ]]; then
-          git -C "${SCRIPTS_DIR}" add "${SNAME}"
-          git -C "${SCRIPTS_DIR}" commit -m "extract: ${SNAME}" --quiet
-        fi
+        git -C "${SCRIPTS_DIR}" add "${SNAME}" 2>/dev/null || true
+        git -C "${SCRIPTS_DIR}" commit -m "extract: ${SNAME}" --quiet 2>/dev/null || true
         echo "   ✓ Gespeichert: ${SPATH}"
         echo "${ENTRY}" >> "${LONG_FILE}.delete"
         ;;
@@ -412,11 +537,6 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 6 — Bereinigung
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX: Zeilennummer-Prefix ENTFERNEN statt Zeile skippen.
-# Gleiche Normalisierung wie Schritt 3 — konsistent für beide Formate.
-# length > 500 entfernt: lange Einträge werden in Schritt 3/5 behandelt,
-# hier soll nur der Cleanup stattfinden ohne legitime Befehle zu verlieren.
-# ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "🧹 SCHRITT 6 — History bereinigen"
 
@@ -428,24 +548,11 @@ if [[ "${REMOVE_SECRETS}" == "J" ]]; then
   grep '^\[.*\] ' "${SECRET_FILE}" | sed 's/^\[.*\] //' >> "${ENTRIES_TO_DELETE}"
 fi
 
+# Deduplizieren — BLOCKS_FILE ist bereits normalisiert
 LC_ALL=C awk '
-  /^[[:space:]]*$/  { next }
-  /^\[200~/         { next }
-
-  # fc -ln / .historynew Format: Nummer entfernen
-  /^[[:space:]]+[0-9]+[[:space:]]/ {
-    sub(/^[[:space:]]+[0-9]+[[:space:]]+/, "")
-    if ($0 == "") next
-  }
-
-  # zsh extended history Format: Timestamp entfernen
-  /^: [0-9]+:[0-9]+;/ {
-    sub(/^: [0-9]+:[0-9]+;/, "")
-    if ($0 == "") next
-  }
-
-  !seen[$0]++ { print }
-' "${MERGED_DUMP}" > "${CLEAN_FILE}"
+  /^[[:space:]]*$/ { next }
+  !seen[$0]++      { print }
+' "${BLOCKS_FILE}" > "${CLEAN_FILE}"
 
 if [[ -s "${ENTRIES_TO_DELETE}" ]]; then
   TEMP_FILTERED="/tmp/zsh_hist_filtered_${TIMESTAMP}.txt"
@@ -488,7 +595,8 @@ else
   echo "   ✓ In-Memory History reloaded"
 fi
 
-rm -f "${MERGED_DUMP}" "${CLEAN_FILE}" "${LONG_FILE}" "${LONG_FILE}.delete" \
+rm -f "${MERGED_DUMP}" "${NORM_DUMP}" "${BLOCKS_FILE}" "${BLOCKS_FILE}.raw" \
+      "${CLEAN_FILE}" "${LONG_FILE}" "${LONG_FILE}.delete" \
       "${SECRET_FILE}" "${ENTRIES_TO_DELETE}" 2>/dev/null || true
 
 echo ""
