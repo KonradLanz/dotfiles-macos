@@ -17,6 +17,11 @@
 #   ⇒ Dieses Script liest mit fc -ln direkt aus dem RAM (Quelle 1)
 #   ⇒ Session-Check ist informativ; fc -ln rettet RAM-History immer
 #
+# Format der .historynew Dateien (macOS Terminal.app):
+#   "   11  befehl"  — führende Leerzeichen + Nummer + 2 Leerzeichen + Befehl
+#   KEIN Timestamp-Format (kein ": 123456:0;befehl")
+#   → awk muss Nummer-Prefix ENTFERNEN, nicht die Zeile skippen!
+#
 # AppleScript fc -W (Schritt 1.5):
 #   Schickt fc -W an alle idle Terminal.app Tabs (busy=false).
 #   Tabs mit laufendem Prozess werden übersprungen (kein Chaos in stdin).
@@ -27,7 +32,6 @@
 # =============================================================================
 
 # WICHTIG: HISTFILE MUSS vor set -u gesetzt sein, sonst crash bei -u Flag
-# Beim Aufruf via "zsh script.sh" ist $HISTFILE in der neuen Shell nicht gesetzt
 _HISTFILE_DEFAULT="${HOME}/.zsh_history"
 if [[ -n "${HISTFILE+x}" ]]; then
   _HISTFILE="${HISTFILE}"
@@ -35,9 +39,7 @@ else
   _HISTFILE="${_HISTFILE_DEFAULT}"
 fi
 
-# Jetzt erst set -eo pipefail — HISTFILE ist nun sicher
 set -eo pipefail
-# Kein -u hier — zu viele zsh-interne Variablen können ungesetzt sein
 
 # --- Config ---
 HISTFILE="${_HISTFILE}"
@@ -69,10 +71,6 @@ echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 1 — Offene Terminal-Sessions analysieren
-# ─────────────────────────────────────────────────────────────────────────────
-# ⚠️  "0 Zeilen" ist NICHT leer — History liegt noch im RAM!
-#    fc -ln (Schritt 2) liest direkt aus dem RAM → nichts geht verloren.
-#    Andere Terminals: deren RAM-History kann nur via "fc -W" gerettet werden.
 # ─────────────────────────────────────────────────────────────────────────────
 echo "📋 SCHRITT 1 — Terminal-Sessions (informativ)"
 
@@ -111,10 +109,6 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 1.5 — fc -W in alle anderen Terminal.app Tabs schicken (optional)
 # ─────────────────────────────────────────────────────────────────────────────
-# Schickt "fc -W" via AppleScript an alle idle Tabs (busy=false).
-# Tabs mit laufendem Prozess werden automatisch übersprungen.
-# Benötigt Accessibility-Rechte; bei Fehler: Warnung, kein Abbruch.
-# ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "📲 SCHRITT 1.5 — fc -W in andere Terminal.app Tabs schicken"
 echo ""
@@ -141,9 +135,6 @@ if [[ "${APPLESCRIPT_RUN}" != "n" && "${APPLESCRIPT_RUN}" != "N" ]]; then
   echo ""
   echo "   → Sende fc -W an alle idle Terminal.app Tabs..."
 
-  # AppleScript: iteriert über alle Fenster und alle Tabs darin.
-  # busy=true  → Prozess läuft (vim, ssh, etc.) → überspringen
-  # busy=false → Shell wartet auf Input (idle) → fc -W schicken
   APPLESCRIPT_RESULT=$(osascript 2>&1 << 'APPLESCRIPT_EOF'
     set sent_count to 0
     set skipped_count to 0
@@ -199,9 +190,6 @@ APPLESCRIPT_EOF
     fi
   fi
 
-  # Im Dry-Run: Meldung dass fc -W trotzdem ausgeführt wurde
-  # (fc -W ist schreibend aber akzeptabel im Dry-Run, da es nur
-  #  RAM auf Disk schreibt — kein Datenverlust möglich)
   [[ "${DRY_RUN}" == 1 ]] && \
     echo "   ℹ️  [DRY-RUN] fc -W wurde trotzdem ausgeführt (nur RAM→Disk, sicher)"
 else
@@ -230,28 +218,26 @@ done
 
 echo "   → Merge aller History-Quellen..."
 
-# Quelle 1: In-Memory History dieses Terminals (fc -ln ohne Zeilennummern)
-# -ln = keine Nummern, sicher auch wenn HISTSIZE nicht gesetzt
+# Quelle 1: In-Memory History dieses Terminals (fc -ln mit Nummern)
+# Format: "   11  befehl" — Nummern werden in Schritt 3/6 sauber entfernt
 fc -ln 1 > "${MERGED_DUMP}" 2>/dev/null || true
 
-# Quelle 2: Alle Session-Files (andere Terminals, jetzt nach fc -W vollständig)
+# Quelle 2: Alle Session-Files (nach fc -W vollständig auf Disk)
+# Format identisch: "   11  befehl"
 for f in ~/.zsh_sessions/*.history(N) ~/.zsh_sessions/*.historynew(N); do
   if [[ -f "$f" && -s "$f" ]]; then
-    grep -v '^[[:space:]]*$' "$f" \
-      | sed 's/^: [0-9]*:[0-9]*;//' \
-      >> "${MERGED_DUMP}" 2>/dev/null || true
+    cat "$f" >> "${MERGED_DUMP}" 2>/dev/null || true
   fi
 done
 
-# Quelle 3: Gespeicherte ~/.zsh_history (History aus geschlossenen Terminals)
+# Quelle 3: Gespeicherte ~/.zsh_history
+# Format: entweder plain oder ": timestamp:0;befehl"
 if [[ -f "${HISTFILE}" ]]; then
-  grep -v '^[[:space:]]*$' "${HISTFILE}" \
-    | sed 's/^: [0-9]*:[0-9]*;//' \
-    >> "${MERGED_DUMP}" 2>/dev/null || true
+  cat "${HISTFILE}" >> "${MERGED_DUMP}" 2>/dev/null || true
 fi
 
 MERGED_COUNT=$(wc -l < "${MERGED_DUMP}" | tr -d ' ')
-echo "   ✓ Gesamt gesammelt: ${MERGED_COUNT} Zeilen (inkl. Duplikate)"
+echo "   ✓ Gesamt gesammelt: ${MERGED_COUNT} Zeilen (inkl. Duplikate + Nummern)"
 
 if [[ "${MERGED_COUNT}" -eq 0 ]]; then
   echo ""
@@ -262,21 +248,37 @@ if [[ "${MERGED_COUNT}" -eq 0 ]]; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SCHRITT 3 — Lange Einträge
+# SCHRITT 3 — Lange Einträge finden
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX: Zeilennummer-Prefix ENTFERNEN statt Zeile skippen.
+# Formate die normalisiert werden:
+#   "   11  befehl"        → "befehl"   (fc -ln / .historynew Format)
+#   ": 1234567:0;befehl"   → "befehl"   (zsh extended history Format)
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "📏 SCHRITT 3 — Lange Einträge analysieren (>${LONG_THRESH} Zeichen)"
 
 LC_ALL=C awk -v thresh="${LONG_THRESH}" '
-  /^[[:space:]]*$/                  { next }
-  /^[[:space:]]+[0-9]+[[:space:]]/ { next }
-  /^\[200~/                         { next }
-  /^: [0-9]+:[0-9]+;/               { next }
-  length($0) > thresh               { print }
+  /^[[:space:]]*$/  { next }
+  /^\[200~/         { next }
+
+  # fc -ln / .historynew Format: "   11  befehl" → Nummer entfernen
+  /^[[:space:]]+[0-9]+[[:space:]]/ {
+    sub(/^[[:space:]]+[0-9]+[[:space:]]+/, "")
+    if ($0 == "") next
+  }
+
+  # zsh extended history Format: ": 1234567:0;befehl" → Timestamp entfernen
+  /^: [0-9]+:[0-9]+;/ {
+    sub(/^: [0-9]+:[0-9]+;/, "")
+    if ($0 == "") next
+  }
+
+  length($0) > thresh { print }
 ' "${MERGED_DUMP}" | sort -u > "${LONG_FILE}"
 
 LONG_COUNT=$(wc -l < "${LONG_FILE}" | tr -d ' ')
-echo "   Gefunden: ${LONG_COUNT} lange Einträge"
+echo "   Gefunden: ${LONG_COUNT} lange Einträge (>${LONG_THRESH} Zeichen)"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 4 — Secret-Erkennung
@@ -304,6 +306,12 @@ SECRET_PATTERNS = [
     r'(?i)(aws_access_key|aws_secret)',
 ]
 
+# Normalisiere Zeile: entferne fc-ln Nummern und zsh-Timestamps
+def normalize(line):
+    line = re.sub(r'^\s+\d+\s+', '', line)
+    line = re.sub(r'^: \d+:\d+;', '', line)
+    return line.strip()
+
 try:
     with open(os.environ.get('MERGED_DUMP', '/tmp/merged.txt')) as f:
         lines = f.readlines()
@@ -311,7 +319,7 @@ except:
     sys.exit(0)
 
 for line in lines:
-    line = line.rstrip()
+    line = normalize(line.rstrip())
     if not line or len(line) < 10: continue
     for pat in SECRET_PATTERNS:
         if re.search(pat, line):
@@ -404,6 +412,11 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 6 — Bereinigung
 # ─────────────────────────────────────────────────────────────────────────────
+# FIX: Zeilennummer-Prefix ENTFERNEN statt Zeile skippen.
+# Gleiche Normalisierung wie Schritt 3 — konsistent für beide Formate.
+# length > 500 entfernt: lange Einträge werden in Schritt 3/5 behandelt,
+# hier soll nur der Cleanup stattfinden ohne legitime Befehle zu verlieren.
+# ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "🧹 SCHRITT 6 — History bereinigen"
 
@@ -416,15 +429,22 @@ if [[ "${REMOVE_SECRETS}" == "J" ]]; then
 fi
 
 LC_ALL=C awk '
-  /^[[:space:]]*$/                  { next }
-  /^[[:space:]]+[0-9]+[[:space:]]/ { next }
-  /^\[200~/                         { next }
+  /^[[:space:]]*$/  { next }
+  /^\[200~/         { next }
+
+  # fc -ln / .historynew Format: Nummer entfernen
+  /^[[:space:]]+[0-9]+[[:space:]]/ {
+    sub(/^[[:space:]]+[0-9]+[[:space:]]+/, "")
+    if ($0 == "") next
+  }
+
+  # zsh extended history Format: Timestamp entfernen
   /^: [0-9]+:[0-9]+;/ {
     sub(/^: [0-9]+:[0-9]+;/, "")
     if ($0 == "") next
   }
-  length($0) > 500 { next }
-  !seen[$0]++      { print }
+
+  !seen[$0]++ { print }
 ' "${MERGED_DUMP}" > "${CLEAN_FILE}"
 
 if [[ -s "${ENTRIES_TO_DELETE}" ]]; then
@@ -435,7 +455,7 @@ if [[ -s "${ENTRIES_TO_DELETE}" ]]; then
 fi
 
 CLEAN_COUNT=$(wc -l < "${CLEAN_FILE}" | tr -d ' ')
-echo "   ✓ Bereinigt: ${CLEAN_COUNT} Einträge (war: ${MERGED_COUNT})"
+echo "   ✓ Bereinigt: ${CLEAN_COUNT} Einträge (war: ${MERGED_COUNT} Rohzeilen)"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 7 — Schreiben + Reload
