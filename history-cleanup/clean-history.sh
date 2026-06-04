@@ -48,7 +48,6 @@ BLOCKS_RAW="/tmp/zsh_hist_blocks_${TIMESTAMP}.raw"
 SINGLES_FILE="/tmp/zsh_hist_singles_${TIMESTAMP}.txt"
 CLEAN_FILE="/tmp/zsh_hist_clean_${TIMESTAMP}.txt"
 SECRET_FILE="/tmp/zsh_hist_secrets_${TIMESTAMP}.txt"
-# Datei für Blöcke die noch nicht entschieden wurden (q oder Abbruch)
 PENDING_BLOCKS_FILE="/tmp/zsh_hist_pending_${TIMESTAMP}.txt"
 MIN_BLOCK_LINES=3
 DRY_RUN=0
@@ -115,21 +114,26 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# SCHRITT 1.5 — fc -W via AppleScript
+# SCHRITT 1.5 — fc -W via AppleScript (auch eigenes Terminal)
+# Eigenes Tab: fc -W direkt aufrufen — kein AppleScript nötig.
+# Andere Tabs: via AppleScript.
 # -----------------------------------------------------------------------------
 echo ""
-echo "📲 SCHRITT 1.5 — fc -W in andere Terminal.app Tabs schicken"
+echo "💾 SCHRITT 1.5 — History auf Disk schreiben (fc -W)"
 echo ""
-echo "   Soll fc -W via AppleScript an alle anderen idle Terminal.app"
-echo "   Fenster/Tabs geschickt werden? (Tabs mit laufendem Prozess"
-echo "   werden automatisch übersprungen.)"
+echo "   fc -W schreibt die RAM-History dieses Terminals zuerst selbst,"
+echo "   dann optional via AppleScript an alle anderen idle Tabs."
+echo ""
+
+# Eigenes Terminal: immer fc -W ausführen
+fc -W 2>/dev/null && echo "   ✓ fc -W (dieses Terminal) ausgeführt" \
+                  || echo "   ⚠️  fc -W (dieses Terminal) fehlgeschlagen — weiter"
+
 echo ""
 echo "   ┌─────────────────────────────────────────────────────────┐"
-echo "   │  ⚠️  Alle anderen Tabs müssen leere Eingabezeile haben. │"
-echo "   │  Sonst wird fc -W direkt angehängt → Fehler.           │"
-echo "   │  Falls nicht sicher: [n] wählen, manuell 'fc -W'.      │"
+echo "   │  ⚠️  Andere Tabs brauchen leere Eingabezeile.         │"
+echo "   │  Falls nicht sicher: [n] wählen, manuell 'fc -W'.  │"
 echo "   └─────────────────────────────────────────────────────────┘"
-echo ""
 ask APPLESCRIPT_RUN "   fc -W an alle anderen Tabs schicken? [J/n] "
 
 if [[ "${APPLESCRIPT_RUN}" != "n" && "${APPLESCRIPT_RUN}" != "N" ]]; then
@@ -167,19 +171,18 @@ APPLESCRIPT_EOF
   )
   if [[ "${APPLESCRIPT_RESULT}" == ERROR:* ]]; then
     echo "   ⚠️  AppleScript Fehler: ${APPLESCRIPT_RESULT#ERROR:}"
-    echo "   → Weiter ohne automatisches fc -W"
   else
     SENT_N="${${APPLESCRIPT_RESULT#OK:}%%:*}"
     SKIPPED_N="${APPLESCRIPT_RESULT##*:}"
     echo "   ✓ fc -W gesendet an ${SENT_N} Tab(s)"
-    [[ "${SKIPPED_N}" -gt 0 ]] && echo "   ℹ️  ${SKIPPED_N} Tab(s) übersprungen"
+    [[ "${SKIPPED_N}" -gt 0 ]] && echo "   ℹ️  ${SKIPPED_N} Tab(s) übersprungen (busy)"
     if [[ "${SENT_N}" -gt 0 ]]; then
       echo "   ⏳ Warte 2s..."
       sleep 2
     fi
   fi
 else
-  echo "   → Übersprungen."
+  echo "   → Andere Tabs übersprungen."
 fi
 echo ""
 
@@ -217,7 +220,10 @@ iconv -f UTF-8 -t UTF-8 -c "${MERGED_DUMP}" > "${MERGED_DUMP}.utf8" 2>/dev/null 
 echo "   ✓ UTF-8 bereinigt"
 
 # -----------------------------------------------------------------------------
-# SCHRITT 2b — Block-Erkennung
+# SCHRITT 2b — Block-Erkennung + Dedup
+# Blöcke werden vor der Interaktion dedupliziert: gleicher normalisierter
+# Inhalt (Whitespace/Timestamp-strip) zählt als Duplikat.
+# Der Blockzähler gibt nach Dedup die echte Zahl aus.
 # -----------------------------------------------------------------------------
 echo "   → Blöcke erkennen (>= ${MIN_BLOCK_LINES} Zeilen)..."
 
@@ -227,15 +233,41 @@ LC_ALL=C grep '\\n.*\\n' "${MERGED_DUMP}" \
       -e 's/^: [0-9]*:[0-9]*;//' \
       -e 's/\\n$//' \
   | LC_ALL=C tr '\n' '\0' \
-  > "${BLOCKS_RAW}" 2>/dev/null || true
+  > "${BLOCKS_RAW}.raw0" 2>/dev/null || true
 
-BLOCK_COUNT=$(python3 -c "
-data = open('${BLOCKS_RAW}', 'rb').read()
-blocks = [b for b in data.split(b'\x00') if b.strip()]
-print(len(blocks))
-" 2>/dev/null || echo 0)
+# Dedup Blöcke via Python: normalisierter Text als Key
+BLOCK_COUNT=$(python3 - << PYEOF_DEDUP
+import sys, re
 
-echo "   ✓ Blöcke (>= ${MIN_BLOCK_LINES} Zeilen): ${BLOCK_COUNT}"
+try:
+    data = open('${BLOCKS_RAW}.raw0', 'rb').read()
+except:
+    print(0); raise SystemExit
+
+raw_blocks = [b for b in data.split(b'\x00') if b.strip()]
+
+seen = set()
+uniq = []
+for b in raw_blocks:
+    # Normalisierungsschlüssel: Leerzeilen entfernen, Whitespace normalisieren
+    key = re.sub(rb'\\\\n', b'\n', b)
+    key = b'\n'.join(ln.strip() for ln in key.splitlines() if ln.strip())
+    if key in seen:
+        continue
+    seen.add(key)
+    uniq.append(b)
+
+# Deduplizierte Blöcke zurückschreiben
+with open('${BLOCKS_RAW}', 'wb') as f:
+    for b in uniq:
+        f.write(b + b'\x00')
+
+print(len(uniq))
+PYEOF_DEDUP
+2>/dev/null || echo 0)
+
+rm -f "${BLOCKS_RAW}.raw0"
+echo "   ✓ Blöcke nach Dedup: ${BLOCK_COUNT}"
 
 # -----------------------------------------------------------------------------
 # SCHRITT 2c — Normalisierung Einzelzeilen
@@ -368,14 +400,8 @@ fi
 
 # -----------------------------------------------------------------------------
 # SCHRITT 5 — Interaktive Block-Extraktion
-#
-# Design:
-# - SINGLES_FILE enthält am Ende NUR Einzelzeilen + explizit behaltene Blöcke.
-# - Blöcke die via [q] oder Loop-Ende nicht entschieden werden, kommen
-#   vollständig als Einzelzeilen in PENDING_BLOCKS_FILE.
-# - Schritt 6 mergt SINGLES_FILE + PENDING_BLOCKS_FILE vor dem Dedup.
-# - [M] less: Datei in /tmp schreiben, dann mit LESSSECURE=1 über /dev/tty.
-# - set +e: read -d NUL gibt Exit 1 am letzten Block.
+# Nicht entschiedene Blöcke → PENDING_BLOCKS_FILE → kommen in History.
+# [M] less: tmp-Datei über /dev/tty als Vordergrundprozess.
 # -----------------------------------------------------------------------------
 touch "${PENDING_BLOCKS_FILE}"
 
@@ -383,7 +409,7 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
   echo ""
   echo "📦 SCHRITT 5 — Mehrzeilige Blöcke extrahieren"
   [[ "${DRY_RUN}" == 1 ]] && echo "   ⚠️  DRY-RUN: Aktionen simuliert, nichts geschrieben"
-  echo "   Blöcke: ${BLOCK_COUNT}  (nicht entschiedene kommen in History)"
+  echo "   Blöcke (nach Dedup): ${BLOCK_COUNT}  —  nicht entschiedene kommen in History"
   echo ""
 
   BLOCK_IDX=0
@@ -448,9 +474,6 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
           ;;
 
         M)
-          # Schreibe Block in tmp-Datei, öffne less direkt über /dev/tty.
-          # Wichtig: less als Vordergrundprozess auf /dev/tty, nicht als
-          # Subshell — daher kein $(...). Nach q kehrt less zurück.
           _LESS_TMP="/tmp/zsh_hist_less_${TIMESTAMP}_${BLOCK_IDX}.txt"
           printf '%s\n' "${BLOCK_DISPLAY}" > "${_LESS_TMP}"
           LESSSECURE=1 less "${_LESS_TMP}" </dev/tty >/dev/tty
@@ -488,7 +511,6 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
           ;;
 
         q|Q)
-          # Aktuellen Block + alle noch nicht gelesenen → pending
           printf '%s\n' "${BLOCK_DISPLAY}" >> "${PENDING_BLOCKS_FILE}"
           ABORT=1
           echo "   → Stop — restliche Blöcke kommen unverändert in die History"
@@ -512,8 +534,6 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
 
   done
 
-  # Alle noch nicht gelesenen Blöcke (nach [q] oder normalem Loop-Ende)
-  # werden als Einzelzeilen in PENDING_BLOCKS_FILE gespeichert.
   if [[ ${ABORT} -eq 1 ]]; then
     while IFS= read -r -d $'\0' BLOCK_RAW <&3; do
       [[ -z "${BLOCK_RAW// }" ]] && continue
@@ -529,7 +549,6 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
   echo "   ✓ Script: ${EXTRACTED_COUNT}  Löschen: ${DELETED_COUNT}  Behalten: ${KEPT_COUNT}  Pending: ${PENDING_COUNT} Zeilen"
 
 else
-  # Kein Schritt 5 — alle Blöcke als pending behandeln (kommen in History)
   set +e
   exec 3< "${BLOCKS_RAW}"
   while IFS= read -r -d $'\0' BLOCK_RAW <&3; do
@@ -545,13 +564,11 @@ fi
 
 # -----------------------------------------------------------------------------
 # SCHRITT 6 — Dedup + Secret-Entfernung
-# Basis: SINGLES_FILE (Einzelzeilen + explizit behaltene Blöcke)
-#      + PENDING_BLOCKS_FILE (nicht entschiedene Blöcke)
+# SINGLES_FILE + PENDING_BLOCKS_FILE → Dedup → CLEAN_FILE
 # -----------------------------------------------------------------------------
 echo ""
 echo "🧹 SCHRITT 6 — History bereinigen"
 
-# Pending-Blöcke an Einzelzeilen anhängen
 if [[ -s "${PENDING_BLOCKS_FILE}" ]]; then
   cat "${PENDING_BLOCKS_FILE}" >> "${SINGLES_FILE}"
   echo "   ℹ️  Pending-Blöcke eingemischt: $(wc -l < "${PENDING_BLOCKS_FILE}" | tr -d ' ') Zeilen"
@@ -602,9 +619,9 @@ else
   echo "   ✓ ${HISTFILE} aktualisiert (${CLEAN_COUNT} Einträge)"
 fi
 
-rm -f "${MERGED_DUMP}" "${BLOCKS_RAW}" "${SINGLES_FILE}" \
-      "${CLEAN_FILE}" "${SECRET_FILE}" "${ENTRIES_TO_DELETE}" \
-      "${PENDING_BLOCKS_FILE}" \
+rm -f "${MERGED_DUMP}" "${BLOCKS_RAW}" "${BLOCKS_RAW}.raw0" \
+      "${SINGLES_FILE}" "${CLEAN_FILE}" "${SECRET_FILE}" \
+      "${ENTRIES_TO_DELETE}" "${PENDING_BLOCKS_FILE}" \
       "/tmp/zsh_hist_filtered_${TIMESTAMP}.txt" \
       /tmp/zsh_hist_less_${TIMESTAMP}_*.txt 2>/dev/null || true
 
