@@ -114,9 +114,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# SCHRITT 1.5 — fc -W via AppleScript (auch eigenes Terminal)
-# Eigenes Tab: fc -W direkt aufrufen — kein AppleScript nötig.
-# Andere Tabs: via AppleScript.
+# SCHRITT 1.5 — fc -W (eigenes Terminal sofort, andere via AppleScript)
 # -----------------------------------------------------------------------------
 echo ""
 echo "💾 SCHRITT 1.5 — History auf Disk schreiben (fc -W)"
@@ -125,7 +123,6 @@ echo "   fc -W schreibt die RAM-History dieses Terminals zuerst selbst,"
 echo "   dann optional via AppleScript an alle anderen idle Tabs."
 echo ""
 
-# Eigenes Terminal: immer fc -W ausführen
 fc -W 2>/dev/null && echo "   ✓ fc -W (dieses Terminal) ausgeführt" \
                   || echo "   ⚠️  fc -W (dieses Terminal) fehlgeschlagen — weiter"
 
@@ -221,9 +218,8 @@ echo "   ✓ UTF-8 bereinigt"
 
 # -----------------------------------------------------------------------------
 # SCHRITT 2b — Block-Erkennung + Dedup
-# Blöcke werden vor der Interaktion dedupliziert: gleicher normalisierter
-# Inhalt (Whitespace/Timestamp-strip) zählt als Duplikat.
-# Der Blockzähler gibt nach Dedup die echte Zahl aus.
+# BLOCKS_RAW.raw0 = alle Rohblöcke (NUL-separiert)
+# BLOCKS_RAW      = nach Dedup (gleicher normalisierter Inhalt = Duplikat)
 # -----------------------------------------------------------------------------
 echo "   → Blöcke erkennen (>= ${MIN_BLOCK_LINES} Zeilen)..."
 
@@ -235,37 +231,42 @@ LC_ALL=C grep '\\n.*\\n' "${MERGED_DUMP}" \
   | LC_ALL=C tr '\n' '\0' \
   > "${BLOCKS_RAW}.raw0" 2>/dev/null || true
 
-# Dedup Blöcke via Python: normalisierter Text als Key
-BLOCK_COUNT=$(python3 - << PYEOF_DEDUP
-import sys, re
+# Python-Dedup: Heredoc GEQUOTET ('PYEOF') damit zsh keine Expansion macht.
+# Dateipfade via Umgebungsvariablen übergeben.
+export _BLOCKS_RAW_IN="${BLOCKS_RAW}.raw0"
+export _BLOCKS_RAW_OUT="${BLOCKS_RAW}"
+BLOCK_COUNT=$(python3 << 'PYEOF_DEDUP'
+import re, os, sys
 
 try:
-    data = open('${BLOCKS_RAW}.raw0', 'rb').read()
-except:
-    print(0); raise SystemExit
+    data = open(os.environ['_BLOCKS_RAW_IN'], 'rb').read()
+except Exception as e:
+    print(0, file=sys.stderr)
+    print(0)
+    raise SystemExit
 
 raw_blocks = [b for b in data.split(b'\x00') if b.strip()]
 
 seen = set()
 uniq = []
 for b in raw_blocks:
-    # Normalisierungsschlüssel: Leerzeilen entfernen, Whitespace normalisieren
-    key = re.sub(rb'\\\\n', b'\n', b)
+    # Normalisierungsschlüssel: \n-Escape expandieren, Leerzeilen + Whitespace strippen
+    key = re.sub(rb'\\n', b'\n', b)
     key = b'\n'.join(ln.strip() for ln in key.splitlines() if ln.strip())
     if key in seen:
         continue
     seen.add(key)
     uniq.append(b)
 
-# Deduplizierte Blöcke zurückschreiben
-with open('${BLOCKS_RAW}', 'wb') as f:
+with open(os.environ['_BLOCKS_RAW_OUT'], 'wb') as f:
     for b in uniq:
         f.write(b + b'\x00')
 
 print(len(uniq))
 PYEOF_DEDUP
-2>/dev/null || echo 0)
+)
 
+unset _BLOCKS_RAW_IN _BLOCKS_RAW_OUT
 rm -f "${BLOCKS_RAW}.raw0"
 echo "   ✓ Blöcke nach Dedup: ${BLOCK_COUNT}"
 
@@ -519,7 +520,6 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
           ;;
 
         *)
-          # [i] oder Enter
           if [[ "${DRY_RUN}" != 1 ]]; then
             printf '%s\n' "${BLOCK_DISPLAY}" >> "${SINGLES_FILE}"
           fi
