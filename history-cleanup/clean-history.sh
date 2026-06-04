@@ -6,26 +6,6 @@
 #   zsh ~/git/dotfiles-macos/history-cleanup/clean-history.sh
 #   zsh ~/git/dotfiles-macos/history-cleanup/clean-history.sh --dry-run
 #   zsh ~/git/dotfiles-macos/history-cleanup/clean-history.sh --skip-extract
-#
-# Block-Format in ~/.zsh_history:
-#   Mehrzeilige Befehle werden als eine Zeile mit literalen \n gespeichert.
-#   Beispiel: "befehl1\nbefehl2\nbefehl3"
-#   Block-Erkennung: Zeilen die mind. 2x literales \n enthalten (= >= 3 Zeilen).
-#   Diese werden vor der Normalisierung extrahiert (NUL-separiert).
-#   Einzelzeilen bleiben immer in der History.
-#
-# Schritt 5 — Block-Extraktion:
-#   [s] Als Script speichern   [i] In History behalten   [d] Löschen
-#   [m] Vollständig in less    [q] Abbrechen
-#   Default: [s]
-#
-# AppleScript fc -W (Schritt 1.5):
-#   Schickt fc -W an alle idle Terminal.app Tabs.
-#   Benötigt Accessibility-Rechte.
-#
-# Schritt 7 (fc -R):
-#   Nicht automatisch ausgeführt — hängt in nicht-interaktiver Subshell.
-#   Hinweis: 'fc -R ~/.zsh_history' in jedem Tab, oder neues Tab öffnen.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -58,9 +38,8 @@ BACKUP_DIR="${HOME}/.zsh_history_backups"
 SCRIPTS_DIR="${HOME}/scripts"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 MERGED_DUMP="/tmp/zsh_hist_merged_${TIMESTAMP}.txt"
-NORM_DUMP="/tmp/zsh_hist_norm_${TIMESTAMP}.txt"
-BLOCKS_RAW="/tmp/zsh_hist_blocks_${TIMESTAMP}.raw"   # NUL-separierte Blöcke (>= MIN_BLOCK_LINES)
-SINGLES_FILE="/tmp/zsh_hist_singles_${TIMESTAMP}.txt" # Einzelzeilen
+BLOCKS_RAW="/tmp/zsh_hist_blocks_${TIMESTAMP}.raw"
+SINGLES_FILE="/tmp/zsh_hist_singles_${TIMESTAMP}.txt"
 CLEAN_FILE="/tmp/zsh_hist_clean_${TIMESTAMP}.txt"
 SECRET_FILE="/tmp/zsh_hist_secrets_${TIMESTAMP}.txt"
 MIN_BLOCK_LINES=3
@@ -225,22 +204,17 @@ MERGED_COUNT=$(wc -l < "${MERGED_DUMP}" | tr -d ' ')
 echo "   ✓ Gesamt: ${MERGED_COUNT} Rohzeilen"
 [[ "${MERGED_COUNT}" -eq 0 ]] && echo "   ❌ Keine Daten!" && exit 1
 
-# -----------------------------------------------------------------------------
-# SCHRITT 2a — UTF-8 Sanitize
-# -----------------------------------------------------------------------------
+# UTF-8 Sanitize
 iconv -f UTF-8 -t UTF-8 -c "${MERGED_DUMP}" > "${MERGED_DUMP}.utf8" 2>/dev/null && \
   mv "${MERGED_DUMP}.utf8" "${MERGED_DUMP}" || true
 echo "   ✓ UTF-8 bereinigt"
 
 # -----------------------------------------------------------------------------
-# SCHRITT 2b — Block-Erkennung VOR Normalisierung
-# Blöcke = Zeilen mit mind. 2x literalem \n (>= 3 Teilzeilen)
-# Diese werden NUL-separiert in BLOCKS_RAW gespeichert.
-# Alle anderen Zeilen → SINGLES_FILE (nach vollständiger Normalisierung).
+# SCHRITT 2b — Block-Erkennung: Zeilen mit >= 2x literalem \n = >= 3 Teilzeilen
+# Extrahiert VOR Normalisierung. Ergebnis: NUL-separiert in BLOCKS_RAW.
 # -----------------------------------------------------------------------------
 echo "   → Blöcke erkennen (>= ${MIN_BLOCK_LINES} Zeilen)..."
 
-# Blöcke rausziehen: Zeilennummer-Prefix + extended-history-Prefix entfernen, dann NUL-separiert speichern
 LC_ALL=C grep '\\n.*\\n' "${MERGED_DUMP}" \
   | LC_ALL=C sed \
       -e 's/^[[:space:]]*[0-9]*[[:space:]]*//' \
@@ -250,7 +224,6 @@ LC_ALL=C grep '\\n.*\\n' "${MERGED_DUMP}" \
   > "${BLOCKS_RAW}" 2>/dev/null || true
 
 BLOCK_COUNT=$(python3 -c "
-import sys
 data = open('${BLOCKS_RAW}', 'rb').read()
 blocks = [b for b in data.split(b'\x00') if b.strip()]
 print(len(blocks))
@@ -259,15 +232,14 @@ print(len(blocks))
 echo "   ✓ Blöcke (>= ${MIN_BLOCK_LINES} Zeilen): ${BLOCK_COUNT}"
 
 # -----------------------------------------------------------------------------
-# SCHRITT 2c — Normalisierung der Einzelzeilen
+# SCHRITT 2c — Normalisierung der Einzelzeilen (alle ohne >=2x \n)
 # -----------------------------------------------------------------------------
 echo "   → Normalisierung Einzelzeilen..."
 
 LC_ALL=C grep -v '\\n.*\\n' "${MERGED_DUMP}" \
-  | LC_ALL=C sed 's/\\n$//' \
-  | LC_ALL=C sed 's/\\n/\n/g' \
+  | LC_ALL=C sed -e 's/\\n$//' -e 's/\\n/\n/g' \
   | LC_ALL=C awk '
-    /^[[:space:]]*$/ { next }
+    /^[[:space:]]*$/  { next }
     /^[[:space:]]+[0-9]+[[:space:]]/ {
       sub(/^[[:space:]]+[0-9]+[[:space:]]+/, "")
       if ($0 == "") next
@@ -292,10 +264,14 @@ for line in sys.stdin:
 " 2>/dev/null > "${SINGLES_FILE}" || true
 
 SINGLES_COUNT=$(wc -l < "${SINGLES_FILE}" | tr -d ' ')
-echo "   ✓ Einzelzeilen nach Normalisierung: ${SINGLES_COUNT}"
+echo "   ✓ Einzelzeilen: ${SINGLES_COUNT}"
 
 # -----------------------------------------------------------------------------
-# SCHRITT 3 — Secret-Erkennung (auf Einzelzeilen)
+# SCHRITT 3 — Secret-Erkennung
+# False-Positives gefiltert:
+#   - ssh/scp mit -p PORT (Portnummer, kein Passwort)
+#   - UUID-Pfade (~/.zsh_sessions/UUID.historynew)
+#   - Dateinamen mit Ziffernblöcken (z.B. SelectedContributions20260222_2123)
 # -----------------------------------------------------------------------------
 echo ""
 echo "🔐 SCHRITT 3 — Secret-Erkennung"
@@ -311,13 +287,28 @@ def shannon_entropy(s):
     return -sum((f/len(s)) * math.log2(f/len(s)) for f in freq.values())
 
 SECRET_PATTERNS = [
-    r'(?i)(password|passwd|--pass|\-p\s+\S{4,}|\-P\s+\S{4,})\s*[=:\s]\s*\S+',
+    r'(?i)(password|passwd|--password)\s*[=:\s]\s*\S+',
     r'(?i)(token|secret|apikey|api_key|api-key)\s*[=:]\s*\S{8,}',
     r'(?i)export\s+(\w*(SECRET|TOKEN|KEY|PASS|PWD)\w*)\s*=\s*\S+',
     r'(?i)Authorization:\s*(Bearer|Basic)\s+\S+',
     r'-----BEGIN\s+(RSA|EC|OPENSSH|PGP)',
     r'(?i)curl.*-u\s+\w+:\S+',
     r'(?i)(aws_access_key|aws_secret)',
+]
+
+# Muster die False-Positives erzeugen
+FALSE_POSITIVE_PATTERNS = [
+    r'^ssh\s+',           # ssh -p PORT ist kein Passwort
+    r'^scp\s+',           # scp -P PORT ist kein Passwort
+    r'^\.zsh_sessions/',  # UUID-Pfade
+    r'historynew$',       # Session-Dateipfade
+]
+
+# Token-Whitelist: Tokens die trotz hoher Entropie keine Secrets sind
+TOKEN_WHITELIST = [
+    r'^[A-Z0-9]{8}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{12}$',  # UUID
+    r'[0-9]{8}',   # Datumsstempel (20260222)
+    r'^[A-Za-z]+[0-9]{4,}',  # Dateiname mit Datum (SelectedContributions20260222)
 ]
 
 try:
@@ -328,12 +319,24 @@ except:
 for line in lines:
     line = line.rstrip()
     if not line or len(line) < 10: continue
+
+    # False-Positive Check: ganze Zeile
+    is_fp = any(re.search(p, line) for p in FALSE_POSITIVE_PATTERNS)
+    if is_fp:
+        continue
+
+    matched = False
     for pat in SECRET_PATTERNS:
         if re.search(pat, line):
             print(f'[PATTERN] {line[:200]}')
+            matched = True
             break
-    else:
+
+    if not matched:
         for tok in re.findall(r'[A-Za-z0-9+/=_\-]{20,}', line):
+            # Token-Whitelist
+            if any(re.search(wp, tok) for wp in TOKEN_WHITELIST):
+                continue
             if shannon_entropy(tok) > 4.2:
                 print(f'[ENTROPY] {line[:200]}')
                 break
@@ -354,7 +357,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# SCHRITT 4 — Script-Name ableiten (Hilfsfunktion)
+# SCHRITT 4 — Script-Name ableiten
 # -----------------------------------------------------------------------------
 _derive_script_name() {
   local block="$1" date_prefix=$(date +%Y%m%d) name=""
@@ -375,8 +378,10 @@ fi
 
 # -----------------------------------------------------------------------------
 # SCHRITT 5 — Interaktive Block-Extraktion
-# Blöcke aus BLOCKS_RAW (NUL-separiert, je >= MIN_BLOCK_LINES Zeilen).
-# Literales \n wird für Anzeige und Script-Ausgabe in echte Newlines gewandelt.
+#
+# WICHTIG: set -e wird hier temporär deaktiviert!
+# "read -d $'\0'" liefert Exit-Code 1 beim letzten Block (EOF ohne NUL),
+# was mit set -eo pipefail das Script sofort abbricht.
 # -----------------------------------------------------------------------------
 if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
   echo ""
@@ -387,15 +392,15 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
   BLOCK_IDX=0
   EXTRACTED_COUNT=0
   DELETED_COUNT=0
-  KEPT_BLOCKS_FILE="/tmp/zsh_hist_kept_${TIMESTAMP}.txt"
 
+  set +e  # read -d NUL liefert Exit 1 am Ende — darf den Loop nicht abbrechen
   exec 3< "${BLOCKS_RAW}"
   while IFS= read -r -d $'\0' BLOCK_RAW <&3; do
     [[ -z "${BLOCK_RAW// }" ]] && continue
 
-    # Für Anzeige und Script: literales \n → echter Newline
-    BLOCK_DISPLAY=$(echo "${BLOCK_RAW}" | LC_ALL=C sed 's/\\n/\n/g')
-    BLOCK_LINES=$(echo "${BLOCK_DISPLAY}" | wc -l | tr -d ' ')
+    # Literales \n → echter Newline für Anzeige + Script
+    BLOCK_DISPLAY=$(printf '%s' "${BLOCK_RAW}" | LC_ALL=C sed 's/\\n/\n/g')
+    BLOCK_LINES=$(printf '%s' "${BLOCK_DISPLAY}" | wc -l | tr -d ' ')
     [[ "${BLOCK_LINES}" -lt "${MIN_BLOCK_LINES}" ]] && continue
 
     BLOCK_IDX=$((BLOCK_IDX + 1))
@@ -404,7 +409,7 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
     echo "   +----------------------------------------------------------+"
     printf "   |  [%d/%d]  %d Zeilen\n" "${BLOCK_IDX}" "${BLOCK_COUNT}" "${BLOCK_LINES}"
     echo "   +----------------------------------------------------------+"
-    echo "${BLOCK_DISPLAY}" | head -3 | while IFS= read -r ln; do
+    printf '%s\n' "${BLOCK_DISPLAY}" | head -3 | while IFS= read -r ln; do
       printf "   %.90s\n" "${ln}"
     done
     [[ "${BLOCK_LINES}" -gt 3 ]] && echo "   ... (${BLOCK_LINES} Zeilen gesamt)"
@@ -415,8 +420,8 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
     ACTION="${ACTION:-s}"
 
     if [[ "${ACTION}" == "m" || "${ACTION}" == "M" ]]; then
-      echo "${BLOCK_DISPLAY}" | less </dev/tty >/dev/tty 2>/dev/null || \
-        echo "${BLOCK_DISPLAY}" | more </dev/tty >/dev/tty 2>/dev/null || true
+      printf '%s\n' "${BLOCK_DISPLAY}" | less </dev/tty >/dev/tty 2>/dev/null || \
+        printf '%s\n' "${BLOCK_DISPLAY}" | more </dev/tty >/dev/tty 2>/dev/null || true
       echo ""
       echo "   [s] Als Script   [i] In History behalten   [d] Löschen   [q] Abbrechen"
       ask ACTION "   Aktion [s]: "
@@ -451,15 +456,15 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
         break
         ;;
       *)
-        # [i] oder Enter ohne Eingabe: in History behalten
-        # Block als Einzelzeilen zurück in SINGLES_FILE schreiben
-        echo "${BLOCK_DISPLAY}" >> "${SINGLES_FILE}"
+        # [i]: Block-Zeilen zurück in SINGLES_FILE (für History)
+        printf '%s\n' "${BLOCK_DISPLAY}" >> "${SINGLES_FILE}"
         echo "   → Behalten"
         ;;
     esac
     echo ""
   done
   exec 3<&-
+  set -e  # set -e wieder aktivieren
 
   echo "   ✓ Extrahiert: ${EXTRACTED_COUNT}  |  Gelöscht: ${DELETED_COUNT}"
 else
@@ -509,7 +514,6 @@ else
     exit 0
   fi
 
-  # Session-Files leeren — truncate statt > (verhindert Hänger bei gelockten Files)
   for f in ~/.zsh_sessions/*.historynew(N) ~/.zsh_sessions/*.history(N); do
     [[ -f "$f" ]] && truncate -s 0 "$f" 2>/dev/null || true
   done
@@ -519,9 +523,9 @@ else
   echo "   ✓ ${HISTFILE} aktualisiert (${CLEAN_COUNT} Einträge)"
 fi
 
-rm -f "${MERGED_DUMP}" "${NORM_DUMP}" "${BLOCKS_RAW}" "${SINGLES_FILE}" \
+rm -f "${MERGED_DUMP}" "${BLOCKS_RAW}" "${SINGLES_FILE}" \
       "${CLEAN_FILE}" "${SECRET_FILE}" "${ENTRIES_TO_DELETE}" \
-      "/tmp/zsh_hist_kept_${TIMESTAMP}.txt" 2>/dev/null || true
+      "/tmp/zsh_hist_filtered_${TIMESTAMP}.txt" 2>/dev/null || true
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
