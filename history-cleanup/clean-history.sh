@@ -71,7 +71,7 @@ BLOCKS_FILE="/tmp/zsh_hist_blocks_${TIMESTAMP}.txt"
 CLEAN_FILE="/tmp/zsh_hist_clean_${TIMESTAMP}.txt"
 LONG_FILE="/tmp/zsh_hist_long_${TIMESTAMP}.txt"
 SECRET_FILE="/tmp/zsh_hist_secrets_${TIMESTAMP}.txt"
-LONG_THRESH=100
+LONG_THRESH=50
 DRY_RUN=0
 SKIP_EXTRACT=0
 
@@ -286,9 +286,6 @@ echo "   ✓ UTF-8 bereinigt"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 2b — Normalisierung
-# Filtert auch Zeilen die ausschließlich aus Unicode Combining-Zeichen,
-# Bracket-Paste-Sequenzen oder nicht-druckbaren Steuerzeichen bestehen
-# (z.B. die \u20F5-Zeilen aus kaputten Paste-Events).
 # ─────────────────────────────────────────────────────────────────────────────
 echo "   → Normalisierung..."
 
@@ -311,15 +308,12 @@ LC_ALL=C sed 's/\\n$//' "${MERGED_DUMP}" \
 import sys, unicodedata
 for line in sys.stdin:
     s = line.rstrip('\n')
-    # Zeile besteht nur aus Combining/Non-spacing Marks oder Steuerzeichen?
     stripped = s.strip()
     if not stripped:
         continue
     cats = [unicodedata.category(c) for c in stripped]
-    # Mn = Non-spacing Mark (Combining), Cc = Control, Cf = Format
     if all(cat in ('Mn','Cc','Cf','Zs','Zl','Zp') for cat in cats):
         continue
-    # Zeile die nur aus ASCII-Steuerzeichen < 0x20 besteht
     if all(ord(c) < 0x20 or ord(c) == 0x7f for c in stripped):
         continue
     print(s)
@@ -385,7 +379,6 @@ LC_ALL=C awk '
 }
 ' "${NORM_DUMP}" > "${BLOCKS_FILE}"
 
-# Block-Zählung via python3 — macOS awk \x00 unzuverlässig
 BLOCK_COUNT=$(python3 -c "
 import sys
 data = open('${BLOCKS_FILE}.raw', 'rb').read()
@@ -533,24 +526,67 @@ fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 5 — Interaktive Extraktion langer Einträge als Scripts
+# Preview: erste 3 Zeilen (je max. 100 Zeichen), [m] für weitere 10 Zeilen.
+# Default-Aktion: [s] (als Script speichern).
 # fd 4 für LONG_FILE → ask() liest explizit von /dev/tty, unabhängig von fd 4.
 # ─────────────────────────────────────────────────────────────────────────────
+_show_entry_preview() {
+  local entry="$1" lines="${2:-3}" max_chars=100
+  print -r -- "${entry}" | head -"${lines}" | while IFS= read -r ln; do
+    print -r -- "   ${ln[1,${max_chars}]}"
+  done
+  local total_lines
+  total_lines=$(print -r -- "${entry}" | wc -l | tr -d ' ')
+  if [[ ${total_lines} -gt ${lines} ]]; then
+    echo "   ... (${total_lines} Zeilen gesamt, ${#entry} Zeichen)"
+  else
+    echo "   (${#entry} Zeichen)"
+  fi
+}
+
 if [[ "${SKIP_EXTRACT}" == 0 && "${LONG_COUNT}" -gt 0 ]]; then
   echo ""
   echo "📝 SCHRITT 5 — Lange Einträge als Scripts speichern"
+  echo "   Schwelle: >${LONG_THRESH} Zeichen | ${LONG_COUNT} Einträge"
   mkdir -p "${SCRIPTS_DIR}"
 
   INDEX=0
   exec 4< "${LONG_FILE}"
   while IFS= read -r ENTRY <&4; do
     INDEX=$((INDEX + 1))
-    PREVIEW="${ENTRY[1,80]}"
     echo ""
-    print -r -- "   [${INDEX}/${LONG_COUNT}] (${#ENTRY} Zeichen)"
-    print -r -- "   ${PREVIEW}..."
+    echo "   ┌─ [${INDEX}/${LONG_COUNT}] $({'─' * 46})"
+    _show_entry_preview "${ENTRY}" 3
+    echo "   └──────────────────────────────────────────────────────"
     echo ""
-    echo "   [s] Als Script   [i] In History behalten   [d] Löschen   [q] Abbrechen"
-    ask ACTION "   Aktion: "
+    echo "   [s] Als Script   [i] In History behalten   [d] Löschen"
+    echo "   [m] Mehr anzeigen (+10 Zeilen)             [q] Abbrechen"
+    ask ACTION "   Aktion [s]: "
+    ACTION="${ACTION:-s}"
+
+    # [m] — mehr Preview, dann erneut fragen
+    while [[ "${ACTION}" == "m" || "${ACTION}" == "M" ]]; do
+      echo ""
+      _show_entry_preview "${ENTRY}" 13
+      echo ""
+      echo "   [s] Als Script   [i] In History behalten   [d] Löschen"
+      echo "   [m] Noch mehr (+10 Zeilen)                 [q] Abbrechen"
+      ask ACTION "   Aktion [s]: "
+      ACTION="${ACTION:-s}"
+      # Für [m] erneut 10 weitere: einfach Zähler erhöhen und neu rendern
+      if [[ "${ACTION}" == "m" || "${ACTION}" == "M" ]]; then
+        # Bereits alles gezeigt — zeige vollständig
+        echo ""
+        echo "   ── Vollständiger Eintrag (${#ENTRY} Zeichen) ──────────────"
+        print -r -- "${ENTRY}" | sed 's/^/   /'
+        echo "   ──────────────────────────────────────────────────────"
+        echo ""
+        echo "   [s] Als Script   [i] In History behalten   [d] Löschen   [q] Abbrechen"
+        ask ACTION "   Aktion [s]: "
+        ACTION="${ACTION:-s}"
+        break
+      fi
+    done
 
     case "${ACTION}" in
       s|S)
@@ -579,7 +615,7 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${LONG_COUNT}" -gt 0 ]]; then
         break
         ;;
       *)
-        echo "   → Behalten"
+        echo "   → Behalten (in History)"
         ;;
     esac
   done
@@ -619,8 +655,6 @@ echo "   ✓ Bereinigt: ${CLEAN_COUNT} Einträge (war: ${MERGED_COUNT} Rohzeilen
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 7 — Schreiben
-# Hinweis: fc -R wird NICHT automatisch ausgeführt (hängt in nicht-interaktiver
-# Subshell auf macOS). Stattdessen Hinweis an den User.
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "💿 SCHRITT 7 — History schreiben"
