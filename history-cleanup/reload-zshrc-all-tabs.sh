@@ -9,7 +9,7 @@
 # =============================================================================
 
 echo ""
-echo "↺  zshrc Reload — alle Terminal-Tabs"
+echo "  zshrc Reload -- alle Terminal-Tabs"
 echo ""
 
 # -----------------------------------------------------------------------------
@@ -17,20 +17,19 @@ echo ""
 # -----------------------------------------------------------------------------
 if [[ -f "${HOME}/.zshrc" ]]; then
   source "${HOME}/.zshrc"
-  echo "   ✓ source ~/.zshrc (dieses Terminal) ausgeführt"
+  echo "   OK: source ~/.zshrc (dieses Terminal) ausgefuehrt"
 else
-  echo "   ⚠️  ~/.zshrc nicht gefunden — übersprungen"
+  echo "   WARN: ~/.zshrc nicht gefunden -- uebersprungen"
 fi
 
 # -----------------------------------------------------------------------------
 # 2. Alle anderen Tabs via AppleScript
-# Tabs mit laufendem Prozess (busy=true) werden übersprungen.
+# Kein Unicode-Escape im do-script String (AppleScript kennt keine \uXXXX).
+# Rueckgabe: "OK:SENT:BUSY:SELF" oder "ERROR:..."
+# Parsing: lokale Variablen statt verschachtelter ${...}-Expansion.
 # -----------------------------------------------------------------------------
 echo ""
-echo "   ┌─────────────────────────────────────────────────────────┐"
-echo "   │  Nur idle Tabs erhalten 'source ~/.zshrc'.         │"
-echo "   │  Busy Tabs (laufender Prozess) werden übersprungen. │"
-echo "   └─────────────────────────────────────────────────────────┘"
+echo "   Sende 'source ~/.zshrc' an alle idle Tabs..."
 echo ""
 
 RESULT=$(osascript 2>&1 << 'APPLESCRIPT_EOF'
@@ -48,7 +47,7 @@ RESULT=$(osascript 2>&1 << 'APPLESCRIPT_EOF'
             if t is front_tab then
               set skipped_self to skipped_self + 1
             else if busy of t is false then
-              do script "source ~/.zshrc && echo '   \u2713 source ~/.zshrc done'" in t
+              do script "source ~/.zshrc" in t
               set sent_count to sent_count + 1
             else
               set skipped_busy to skipped_busy + 1
@@ -71,21 +70,27 @@ RESULT=$(osascript 2>&1 << 'APPLESCRIPT_EOF'
 APPLESCRIPT_EOF
 )
 
+# Robustes Parsing ohne verschachtelte ${...}-Expansion
+# Format erwartet: OK:SENT:SKIPPED_BUSY:SKIPPED_SELF
 if [[ "${RESULT}" == ERROR:* ]]; then
-  echo "   ⚠️  AppleScript Fehler: ${RESULT#ERROR:}"
-  echo "   → Bitte 'source ~/.zshrc' in anderen Tabs manuell ausführen."
+  echo "   FEHLER AppleScript: ${RESULT#ERROR:}"
+  echo "   -> Bitte 'source ~/.zshrc' in anderen Tabs manuell ausfuehren."
 else
-  SENT="${${RESULT#OK:}%%:*}"
-  REST="${RESULT#OK:*:}"
-  SKIPPED_BUSY="${REST%%:*}"
-  SKIPPED_SELF="${REST##*:}"
-  echo "   ✓ source ~/.zshrc gesendet an: ${SENT} Tab(s)"
-  [[ "${SKIPPED_BUSY}" -gt 0 ]] && \
-    echo "   ℹ️  ${SKIPPED_BUSY} Tab(s) übersprungen (busy)"
-  [[ "${SKIPPED_SELF}" -gt 0 ]] && \
-    echo "   ℹ️  ${SKIPPED_SELF} Tab (dieses) bereits direkt gesourct"
+  _r="${RESULT#OK:}"
+  _SENT="${_r%%:*}"         ; _r="${_r#*:}"
+  _BUSY="${_r%%:*}"         ; _r="${_r#*:}"
+  _SELF="${_r%%:*}"
+
+  # Numerisch validieren bevor -gt verwendet wird
+  [[ "${_SENT}" =~ ^[0-9]+$ ]] || _SENT=0
+  [[ "${_BUSY}" =~ ^[0-9]+$ ]] || _BUSY=0
+  [[ "${_SELF}" =~ ^[0-9]+$ ]] || _SELF=0
+
+  echo "   OK: source ~/.zshrc gesendet an ${_SENT} Tab(s)"
+  [[ ${_BUSY} -gt 0 ]] && echo "   INFO: ${_BUSY} Tab(s) uebersprungen (busy)"
+  [[ ${_SELF} -gt 0 ]] && echo "   INFO: ${_SELF} Tab (dieses) direkt gesourct"
 fi
 
 echo ""
-echo "   ✔  Fertig."
+echo "   Fertig."
 echo ""
