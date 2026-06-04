@@ -11,27 +11,25 @@
 #   [s] Als Script speichern
 #   [i] In History behalten
 #   [d] Löschen
-#   [m] Nächste 10 Zeilen inline anzeigen (wiederholbar)
+#   [m] Nächste 10 Zeilen inline (wiederholbar)
 #   [M] Vollständig in less (q zum Beenden, danach Aktion wählen)
-#   [q] Abbrechen
+#   [q] Abbrechen (restliche Blöcke alle in History behalten)
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# SCHRITT 0 — Auto-Pull
+# SCHRITT 0 — Auto-Pull (immer verbose)
 # -----------------------------------------------------------------------------
 _SCRIPT_DIR="${${(%):-%x}:A:h}"
 if [[ -d "${_SCRIPT_DIR}/../.git" ]]; then
+  echo "🔄 Schritt 0 — Auto-Pull..."
   _PULL_OUT=$(git -C "${_SCRIPT_DIR}/.." pull --ff-only 2>&1)
   _PULL_RC=$?
   if [[ ${_PULL_RC} -eq 0 ]]; then
-    if [[ "${_PULL_OUT}" == *"Already up to date"* ]]; then
-      echo "✓ Script ist aktuell (git pull)"
-    else
-      echo "🔄 Script aktualisiert (git pull):"
-      echo "${_PULL_OUT}" | sed 's/^/   /'
-    fi
+    echo "   ${_PULL_OUT}"
   else
-    echo "⚠️  git pull fehlgeschlagen — lokale Version wird verwendet"
+    echo "   ⚠️  git pull fehlgeschlagen:"
+    echo "   ${_PULL_OUT}"
+    echo "   → Lokale Version wird verwendet"
   fi
 fi
 
@@ -50,6 +48,8 @@ BLOCKS_RAW="/tmp/zsh_hist_blocks_${TIMESTAMP}.raw"
 SINGLES_FILE="/tmp/zsh_hist_singles_${TIMESTAMP}.txt"
 CLEAN_FILE="/tmp/zsh_hist_clean_${TIMESTAMP}.txt"
 SECRET_FILE="/tmp/zsh_hist_secrets_${TIMESTAMP}.txt"
+# Datei für Blöcke die noch nicht entschieden wurden (q oder Abbruch)
+PENDING_BLOCKS_FILE="/tmp/zsh_hist_pending_${TIMESTAMP}.txt"
 MIN_BLOCK_LINES=3
 DRY_RUN=0
 SKIP_EXTRACT=0
@@ -369,45 +369,43 @@ fi
 # -----------------------------------------------------------------------------
 # SCHRITT 5 — Interaktive Block-Extraktion
 #
-# [m] = nächste 10 Zeilen inline (wiederholbar, kein Pager)
-# [M] = less über /dev/tty (less liest + schreibt direkt aufs Terminal,
-#        kein stdin/stdout-Konflikt, man kommt mit q zurück)
-# DRY-RUN: volle Interaktion, aber kein Schreiben auf Disk
-# set +e nötig: read -d $'\0' gibt Exit 1 am letzten Block
+# Design:
+# - SINGLES_FILE enthält am Ende NUR Einzelzeilen + explizit behaltene Blöcke.
+# - Blöcke die via [q] oder Loop-Ende nicht entschieden werden, kommen
+#   vollständig als Einzelzeilen in PENDING_BLOCKS_FILE.
+# - Schritt 6 mergt SINGLES_FILE + PENDING_BLOCKS_FILE vor dem Dedup.
+# - [M] less: Datei in /tmp schreiben, dann mit LESSSECURE=1 über /dev/tty.
+# - set +e: read -d NUL gibt Exit 1 am letzten Block.
 # -----------------------------------------------------------------------------
+touch "${PENDING_BLOCKS_FILE}"
+
 if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
   echo ""
   echo "📦 SCHRITT 5 — Mehrzeilige Blöcke extrahieren"
-  [[ "${DRY_RUN}" == 1 ]] && echo "   ⚠️  DRY-RUN: Aktionen werden simuliert, nichts geschrieben"
-  echo "   Blöcke mit >= ${MIN_BLOCK_LINES} Zeilen: ${BLOCK_COUNT}"
+  [[ "${DRY_RUN}" == 1 ]] && echo "   ⚠️  DRY-RUN: Aktionen simuliert, nichts geschrieben"
+  echo "   Blöcke: ${BLOCK_COUNT}  (nicht entschiedene kommen in History)"
   echo ""
 
   BLOCK_IDX=0
   EXTRACTED_COUNT=0
   DELETED_COUNT=0
   KEPT_COUNT=0
+  ABORT=0
 
-  # Hilfsfunktion: Block-Header + erste N Zeilen ausgeben
-  # Argumente: $1=BLOCK_DISPLAY $2=BLOCK_LINES $3=BLOCK_IDX $4=BLOCK_COUNT $5=ab_zeile (0-basiert)
   _show_block_lines() {
-    local display="$1" total_lines="$2" idx="$3" total_blocks="$4" from_line="$5"
-    local preview_count=10
-    local show_from=$(( from_line + 1 ))   # 1-basiert für Anzeige
-    local show_to=$(( from_line + preview_count ))
+    local display="$1" total_lines=$2 idx=$3 total_blocks=$4 from_line=$5
+    local show_to=$(( from_line + 10 ))
     [[ ${show_to} -gt ${total_lines} ]] && show_to=${total_lines}
     echo "   +----------------------------------------------------------+"
-    printf "   |  Block [%d/%d]  —  %d Zeilen total  (Zeilen %d–%d)\n" \
-      "${idx}" "${total_blocks}" "${total_lines}" "${show_from}" "${show_to}"
+    printf "   |  Block [%d/%d] — %d Zeilen  (Zeilen %d–%d)\n" \
+      ${idx} ${total_blocks} ${total_lines} $(( from_line + 1 )) ${show_to}
     echo "   +----------------------------------------------------------+"
     printf '%s\n' "${display}" \
       | tail -n +$(( from_line + 1 )) \
-      | head -n ${preview_count} \
-      | while IFS= read -r ln; do
-          printf "   | %.88s\n" "${ln}"
-        done
-    if [[ ${show_to} -lt ${total_lines} ]]; then
+      | head -n 10 \
+      | while IFS= read -r ln; do printf "   | %.88s\n" "${ln}"; done
+    [[ ${show_to} -lt ${total_lines} ]] && \
       echo "   | ... (noch $(( total_lines - show_to )) Zeilen)"
-    fi
     echo "   +----------------------------------------------------------+"
   }
 
@@ -418,19 +416,18 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
 
     BLOCK_DISPLAY=$(printf '%s' "${BLOCK_RAW}" | LC_ALL=C sed 's/\\n/\n/g')
     BLOCK_LINES=$(printf '%s' "${BLOCK_DISPLAY}" | wc -l | tr -d ' ')
-    [[ "${BLOCK_LINES}" -lt "${MIN_BLOCK_LINES}" ]] && continue
+    [[ "${BLOCK_LINES}" -lt "${MIN_BLOCK_LINES}" ]] && \
+      printf '%s\n' "${BLOCK_DISPLAY}" >> "${PENDING_BLOCKS_FILE}" && continue
 
     BLOCK_IDX=$(( BLOCK_IDX + 1 ))
     SUGGESTED=$(_derive_script_name "${BLOCK_RAW}")
-    PREVIEW_FROM=0   # wie viele Zeilen schon gezeigt
+    PREVIEW_FROM=0
 
-    # Erste Vorschau
-    _show_block_lines "${BLOCK_DISPLAY}" "${BLOCK_LINES}" \
-      "${BLOCK_IDX}" "${BLOCK_COUNT}" "${PREVIEW_FROM}"
-    PREVIEW_FROM=3   # nach Header nächstes [m] startet ab Zeile 3
+    _show_block_lines "${BLOCK_DISPLAY}" ${BLOCK_LINES} \
+      ${BLOCK_IDX} ${BLOCK_COUNT} ${PREVIEW_FROM}
+    PREVIEW_FROM=10
     echo ""
 
-    # Aktions-Schleife: bleibt im Block bis echte Entscheidung
     while true; do
       echo "   [s] Script  [i] Behalten  [d] Löschen  [m] +10 Zeilen  [M] less  [q] Stop"
       ask ACTION "   Aktion [s]: "
@@ -438,13 +435,12 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
 
       case "${ACTION}" in
 
-        m|m)
-          # Nächste 10 Zeilen inline
+        m)
           if [[ ${PREVIEW_FROM} -ge ${BLOCK_LINES} ]]; then
-            echo "   (alle ${BLOCK_LINES} Zeilen bereits gezeigt)"
+            echo "   (alle ${BLOCK_LINES} Zeilen gezeigt)"
           else
-            _show_block_lines "${BLOCK_DISPLAY}" "${BLOCK_LINES}" \
-              "${BLOCK_IDX}" "${BLOCK_COUNT}" "${PREVIEW_FROM}"
+            _show_block_lines "${BLOCK_DISPLAY}" ${BLOCK_LINES} \
+              ${BLOCK_IDX} ${BLOCK_COUNT} ${PREVIEW_FROM}
             PREVIEW_FROM=$(( PREVIEW_FROM + 10 ))
           fi
           echo ""
@@ -452,12 +448,12 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
           ;;
 
         M)
-          # less mit direktem tty-Zugriff — kein stdin/stdout-Mix
-          # less bekommt die Datei als Argument (nicht per Pipe),
-          # tty für Tastatur-Input wird über LESSSECURE nicht blockiert.
-          _LESS_TMP="/tmp/zsh_hist_block_less_${TIMESTAMP}_${BLOCK_IDX}.txt"
+          # Schreibe Block in tmp-Datei, öffne less direkt über /dev/tty.
+          # Wichtig: less als Vordergrundprozess auf /dev/tty, nicht als
+          # Subshell — daher kein $(...). Nach q kehrt less zurück.
+          _LESS_TMP="/tmp/zsh_hist_less_${TIMESTAMP}_${BLOCK_IDX}.txt"
           printf '%s\n' "${BLOCK_DISPLAY}" > "${_LESS_TMP}"
-          less "${_LESS_TMP}" < /dev/tty > /dev/tty 2>/dev/tty
+          LESSSECURE=1 less "${_LESS_TMP}" </dev/tty >/dev/tty
           rm -f "${_LESS_TMP}"
           echo ""
           continue
@@ -492,16 +488,17 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
           ;;
 
         q|Q)
-          echo "   → Abgebrochen (restliche Blöcke übersprungen)"
-          BLOCK_IDX=${BLOCK_COUNT}   # verhindert weitere Iterationen
+          # Aktuellen Block + alle noch nicht gelesenen → pending
+          printf '%s\n' "${BLOCK_DISPLAY}" >> "${PENDING_BLOCKS_FILE}"
+          ABORT=1
+          echo "   → Stop — restliche Blöcke kommen unverändert in die History"
+          echo ""
           break 2
           ;;
 
         *)
-          # [i]: Block in SINGLES_FILE zurück (für History)
-          if [[ "${DRY_RUN}" == 1 ]]; then
-            echo "   [DRY-RUN] Würde in History behalten"
-          else
+          # [i] oder Enter
+          if [[ "${DRY_RUN}" != 1 ]]; then
             printf '%s\n' "${BLOCK_DISPLAY}" >> "${SINGLES_FILE}"
           fi
           echo "   → In History behalten"
@@ -514,21 +511,51 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
     done
 
   done
+
+  # Alle noch nicht gelesenen Blöcke (nach [q] oder normalem Loop-Ende)
+  # werden als Einzelzeilen in PENDING_BLOCKS_FILE gespeichert.
+  if [[ ${ABORT} -eq 1 ]]; then
+    while IFS= read -r -d $'\0' BLOCK_RAW <&3; do
+      [[ -z "${BLOCK_RAW// }" ]] && continue
+      BLOCK_DISPLAY=$(printf '%s' "${BLOCK_RAW}" | LC_ALL=C sed 's/\\n/\n/g')
+      printf '%s\n' "${BLOCK_DISPLAY}" >> "${PENDING_BLOCKS_FILE}"
+    done
+  fi
+
   exec 3<&-
   set -e
 
-  echo "   ✓ Script: ${EXTRACTED_COUNT}  |  Löschen: ${DELETED_COUNT}  |  Behalten: ${KEPT_COUNT}"
+  PENDING_COUNT=$(wc -l < "${PENDING_BLOCKS_FILE}" | tr -d ' ')
+  echo "   ✓ Script: ${EXTRACTED_COUNT}  Löschen: ${DELETED_COUNT}  Behalten: ${KEPT_COUNT}  Pending: ${PENDING_COUNT} Zeilen"
 
 else
-  [[ "${SKIP_EXTRACT}" == 1 ]] && echo "" && echo "   → Schritt 5 übersprungen (--skip-extract)"
+  # Kein Schritt 5 — alle Blöcke als pending behandeln (kommen in History)
+  set +e
+  exec 3< "${BLOCKS_RAW}"
+  while IFS= read -r -d $'\0' BLOCK_RAW <&3; do
+    [[ -z "${BLOCK_RAW// }" ]] && continue
+    BLOCK_DISPLAY=$(printf '%s' "${BLOCK_RAW}" | LC_ALL=C sed 's/\\n/\n/g')
+    printf '%s\n' "${BLOCK_DISPLAY}" >> "${PENDING_BLOCKS_FILE}"
+  done
+  exec 3<&-
+  set -e
+  [[ "${SKIP_EXTRACT}" == 1 ]] && echo "" && echo "   → Schritt 5 übersprungen — alle Blöcke in History"
   [[ "${BLOCK_COUNT}" -eq 0 ]] && echo "" && echo "   ℹ️  Keine Blöcke >= ${MIN_BLOCK_LINES} Zeilen"
 fi
 
 # -----------------------------------------------------------------------------
 # SCHRITT 6 — Dedup + Secret-Entfernung
+# Basis: SINGLES_FILE (Einzelzeilen + explizit behaltene Blöcke)
+#      + PENDING_BLOCKS_FILE (nicht entschiedene Blöcke)
 # -----------------------------------------------------------------------------
 echo ""
 echo "🧹 SCHRITT 6 — History bereinigen"
+
+# Pending-Blöcke an Einzelzeilen anhängen
+if [[ -s "${PENDING_BLOCKS_FILE}" ]]; then
+  cat "${PENDING_BLOCKS_FILE}" >> "${SINGLES_FILE}"
+  echo "   ℹ️  Pending-Blöcke eingemischt: $(wc -l < "${PENDING_BLOCKS_FILE}" | tr -d ' ') Zeilen"
+fi
 
 ENTRIES_TO_DELETE="/tmp/zsh_hist_delete_${TIMESTAMP}.txt"
 touch "${ENTRIES_TO_DELETE}"
@@ -577,8 +604,9 @@ fi
 
 rm -f "${MERGED_DUMP}" "${BLOCKS_RAW}" "${SINGLES_FILE}" \
       "${CLEAN_FILE}" "${SECRET_FILE}" "${ENTRIES_TO_DELETE}" \
+      "${PENDING_BLOCKS_FILE}" \
       "/tmp/zsh_hist_filtered_${TIMESTAMP}.txt" \
-      /tmp/zsh_hist_block_less_${TIMESTAMP}_*.txt 2>/dev/null || true
+      /tmp/zsh_hist_less_${TIMESTAMP}_*.txt 2>/dev/null || true
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
