@@ -19,11 +19,17 @@
 #   2. literales \n → echter Zeilenumbruch
 #   3. Zeilennummer-Prefix entfernen ("   11  " → "")
 #   4. zsh extended history Prefix entfernen (": 123:0;" → "")
-#   5. Backslash-Continuation Blöcke → auto in ~/scripts/ extrahieren
+#   5. Zeilen die nur aus Unicode-Combining/Steuerzeichen bestehen entfernen
+#   6. Backslash-Continuation Blöcke → auto in ~/scripts/ extrahieren
 #
 # AppleScript fc -W (Schritt 1.5):
 #   Schickt fc -W an alle idle Terminal.app Tabs (busy=false).
 #   Benötigt Accessibility-Rechte (Einstellungen > Datenschutz > Bedienungshilfen).
+#
+# Schritt 7 (fc -R):
+#   fc -R wird NICHT mehr automatisch ausgeführt da es in einer nicht-interaktiven
+#   Subshell auf macOS hängen kann. Stattdessen Hinweis: in jedem Terminal-Tab
+#   einmalig 'fc -R ~/.zsh_history' eingeben oder neues Tab öffnen.
 # =============================================================================
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -269,6 +275,9 @@ echo "   ✓ UTF-8 bereinigt"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 2b — Normalisierung
+# Filtert auch Zeilen die ausschließlich aus Unicode Combining-Zeichen,
+# Bracket-Paste-Sequenzen oder nicht-druckbaren Steuerzeichen bestehen
+# (z.B. die \u20F5-Zeilen aus kaputten Paste-Events).
 # ─────────────────────────────────────────────────────────────────────────────
 echo "   → Normalisierung..."
 
@@ -286,7 +295,24 @@ LC_ALL=C sed 's/\\n$//' "${MERGED_DUMP}" \
     }
     /^\[200~/ { next }
     { print }
-  ' > "${NORM_DUMP}"
+  ' \
+  | python3 -c "
+import sys, unicodedata
+for line in sys.stdin:
+    s = line.rstrip('\n')
+    # Zeile besteht nur aus Combining/Non-spacing Marks oder Steuerzeichen?
+    stripped = s.strip()
+    if not stripped:
+        continue
+    cats = [unicodedata.category(c) for c in stripped]
+    # Mn = Non-spacing Mark (Combining), Cc = Control, Cf = Format
+    if all(cat in ('Mn','Cc','Cf','Zs','Zl','Zp') for cat in cats):
+        continue
+    # Zeile die nur aus ASCII-Steuerzeichen < 0x20 besteht
+    if all(ord(c) < 0x20 or ord(c) == 0x7f for c in stripped):
+        continue
+    print(s)
+" > "${NORM_DUMP}"
 
 NORM_COUNT=$(wc -l < "${NORM_DUMP}" | tr -d ' ')
 echo "   ✓ Normalisiert: ${NORM_COUNT} Zeilen"
@@ -497,14 +523,7 @@ fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 5 — Interaktive Extraktion langer Einträge als Scripts
-#
-# Kernproblem bisher: "done < LONG_FILE" legte LONG_FILE auf stdin.
-# Dadurch las "read ACTION" aus der Datei statt von der Tastatur —
-# bei EOF (letzter Eintrag ohne trailing newline) bekam read einen
-# leeren String, traf den *-Zweig nicht mehr und der Loop endete still.
-#
-# Fix: LONG_FILE über fd 4 einlesen (wie BLOCKS_FILE.raw über fd 3).
-# stdin (/dev/tty) bleibt damit frei für alle interaktiven read-Aufrufe.
+# fd 4 für LONG_FILE → stdin bleibt /dev/tty frei für interaktive read-Aufrufe.
 # ─────────────────────────────────────────────────────────────────────────────
 if [[ "${SKIP_EXTRACT}" == 0 && "${LONG_COUNT}" -gt 0 ]]; then
   echo ""
@@ -590,7 +609,9 @@ CLEAN_COUNT=$(wc -l < "${CLEAN_FILE}" | tr -d ' ')
 echo "   ✓ Bereinigt: ${CLEAN_COUNT} Einträge (war: ${MERGED_COUNT} Rohzeilen)"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SCHRITT 7 — Schreiben + Reload
+# SCHRITT 7 — Schreiben
+# Hinweis: fc -R wird NICHT automatisch ausgeführt (hängt in nicht-interaktiver
+# Subshell auf macOS). Stattdessen Hinweis an den User.
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "💿 SCHRITT 7 — History schreiben"
@@ -615,9 +636,6 @@ else
 
   cp "${CLEAN_FILE}" "${HISTFILE}"
   echo "   ✓ ${HISTFILE} aktualisiert (${CLEAN_COUNT} Einträge)"
-
-  fc -R "${HISTFILE}" 2>/dev/null || true
-  echo "   ✓ In-Memory History reloaded"
 fi
 
 rm -f "${MERGED_DUMP}" "${NORM_DUMP}" "${BLOCKS_FILE}" "${BLOCKS_FILE}.raw" \
@@ -627,5 +645,11 @@ rm -f "${MERGED_DUMP}" "${NORM_DUMP}" "${BLOCKS_FILE}" "${BLOCKS_FILE}.raw" \
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
 echo "║  ✅ Fertig!  Backup: ~/.zsh_history_backups/         ║"
+if [[ "${DRY_RUN}" != 1 ]]; then
+  echo "║                                                    ║"
+  echo "║  ℹ️  History in diesem Tab noch nicht aktuell.    ║"
+  echo "║  → Einmalig eingeben: fc -R ~/.zsh_history         ║"
+  echo "║  → Oder einfach neues Terminal-Tab öffnen.         ║"
+fi
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
