@@ -25,6 +25,23 @@
 #   Benötigt Accessibility-Rechte (Einstellungen > Datenschutz > Bedienungshilfen).
 # =============================================================================
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SCHRITT 0 — Auto-Pull (Script immer aktuell halten)
+# ─────────────────────────────────────────────────────────────────────────────
+_SCRIPT_DIR="${0:A:h}"
+if [[ -d "${_SCRIPT_DIR}/../.git" ]]; then
+  _PULL_OUT=$(git -C "${_SCRIPT_DIR}" pull --ff-only --quiet 2>&1)
+  _PULL_RC=$?
+  if [[ ${_PULL_RC} -eq 0 ]]; then
+    if [[ -n "${_PULL_OUT}" ]]; then
+      echo "🔄 Script aktualisiert (git pull)"
+    fi
+    # Stilles Enter-Durchentern: kein Output wenn bereits aktuell
+  else
+    echo "⚠️  git pull fehlgeschlagen (offline oder Konflikt) — lokale Version wird verwendet"
+  fi
+fi
+
 _HISTFILE_DEFAULT="${HOME}/.zsh_history"
 if [[ -n "${HISTFILE+x}" ]]; then
   _HISTFILE="${HISTFILE}"
@@ -273,7 +290,8 @@ echo "   ✓ Normalisiert: ${NORM_COUNT} Zeilen"
 # ─────────────────────────────────────────────────────────────────────────────
 # Blöcke erkennen: Zeile endet auf \ → sammeln bis Leerzeile oder Zeile ohne \
 # Blöcke → automatisch nach ~/scripts/ (mit abgeleitetem Namen)
-# Einzelzeilen → NORM_DUMP bereinigt (BLOCKS_FILE enthält nur plain Zeilen)
+# Plain Zeilen → BLOCKS_FILE (Basis für Schritt 3–6)
+# Block-Zählung: awk-basiert (macOS tr kennt kein NUL-counting zuverlässig)
 # ─────────────────────────────────────────────────────────────────────────────
 echo "   → Blöcke erkennen..."
 mkdir -p "${SCRIPTS_DIR}"
@@ -298,14 +316,11 @@ _derive_script_name() {
     name=$(echo "${block}" | grep -v '^#' | head -1 | awk '{print $1}' | tr -cd 'a-z0-9_-' | cut -c1-20)
   fi
 
-  # Fallback: generisch
   [[ -z "${name}" ]] && name="script"
-
   echo "${date_prefix}_${name}"
 }
 
-# Block-Verarbeitung mit awk — schreibt plain Zeilen nach BLOCKS_FILE
-# und gibt Blöcke als NUL-separierte Strings aus für Shell-Verarbeitung
+# Blöcke als NUL-separiert in .raw, plain Zeilen in BLOCKS_FILE
 LC_ALL=C awk '
 /\\$/ {
   sub(/\\$/, "")
@@ -323,7 +338,6 @@ LC_ALL=C awk '
 END { if (block != "") printf "%s\x00", block }
 ' "${NORM_DUMP}" > "${BLOCKS_FILE}.raw"
 
-# Plain Zeilen (keine Blöcke) extrahieren
 LC_ALL=C awk '
 /\\$/ {
   sub(/\\$/, "")
@@ -340,7 +354,8 @@ LC_ALL=C awk '
 }
 ' "${NORM_DUMP}" > "${BLOCKS_FILE}"
 
-BLOCK_COUNT=$(LC_ALL=C tr -cd '\0' < "${BLOCKS_FILE}.raw" | wc -c | tr -d ' ')
+# Block-Zählung macOS-kompatibel via awk (kein tr NUL-counting)
+BLOCK_COUNT=$(LC_ALL=C awk 'BEGIN{n=0} /\x00/{n++} END{print n}' "${BLOCKS_FILE}.raw")
 PLAIN_COUNT=$(wc -l < "${BLOCKS_FILE}" | tr -d ' ')
 echo "   ✓ Blöcke erkannt: ${BLOCK_COUNT} (→ ~/scripts/)"
 echo "   ✓ Einzelzeilen:   ${PLAIN_COUNT}"
@@ -356,12 +371,11 @@ if [[ "${BLOCK_COUNT}" -gt 0 && "${SKIP_EXTRACT}" == 0 ]]; then
     SUGGESTED=$(_derive_script_name "${BLOCK}")
     PREVIEW=$(echo "${BLOCK}" | head -3)
 
-    echo "   [$BLOCK_IDX/${BLOCK_COUNT}] Vorgeschlagener Name: ${SUGGESTED}"
+    echo "   [${BLOCK_IDX}/${BLOCK_COUNT}] Vorgeschlagener Name: ${SUGGESTED}"
     echo "   Preview:"
     echo "${PREVIEW}" | sed 's/^/     /'
     echo ""
 
-    # Name prüfen: wenn nicht ableitbar (nur Datum + "script") → nachfragen
     if [[ "${SUGGESTED}" == *"_script" && $(echo "${BLOCK}" | grep -c '^#') -eq 0 ]]; then
       read "BNAME?   Name (Enter = ${SUGGESTED}, d = löschen, s = überspringen): "
     else
@@ -413,7 +427,7 @@ echo "📏 SCHRITT 3 — Lange Einträge analysieren (>${LONG_THRESH} Zeichen)"
 
 LC_ALL=C awk -v thresh="${LONG_THRESH}" '
   length($0) > thresh { print }
-' "${BLOCKS_FILE}" | sort -u > "${LONG_FILE}"
+' "${BLOCKS_FILE}" | LC_ALL=C sort -u > "${LONG_FILE}"
 
 LONG_COUNT=$(wc -l < "${LONG_FILE}" | tr -d ' ')
 echo "   Gefunden: ${LONG_COUNT} lange Einträge (>${LONG_THRESH} Zeichen)"
@@ -548,7 +562,6 @@ if [[ "${REMOVE_SECRETS}" == "J" ]]; then
   grep '^\[.*\] ' "${SECRET_FILE}" | sed 's/^\[.*\] //' >> "${ENTRIES_TO_DELETE}"
 fi
 
-# Deduplizieren — BLOCKS_FILE ist bereits normalisiert
 LC_ALL=C awk '
   /^[[:space:]]*$/ { next }
   !seen[$0]++      { print }
