@@ -1,0 +1,13 @@
+# rdfind output
+results.txt
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
