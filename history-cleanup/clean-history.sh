@@ -6,6 +6,14 @@
 #   zsh ~/git/dotfiles-macos/history-cleanup/clean-history.sh
 #   zsh ~/git/dotfiles-macos/history-cleanup/clean-history.sh --dry-run
 #   zsh ~/git/dotfiles-macos/history-cleanup/clean-history.sh --skip-extract
+#
+# Schritt 5 Aktionen:
+#   [s] Als Script speichern
+#   [i] In History behalten
+#   [d] Löschen
+#   [m] Nächste 10 Zeilen inline anzeigen (wiederholbar)
+#   [M] Vollständig in less (q zum Beenden, danach Aktion wählen)
+#   [q] Abbrechen
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -204,14 +212,12 @@ MERGED_COUNT=$(wc -l < "${MERGED_DUMP}" | tr -d ' ')
 echo "   ✓ Gesamt: ${MERGED_COUNT} Rohzeilen"
 [[ "${MERGED_COUNT}" -eq 0 ]] && echo "   ❌ Keine Daten!" && exit 1
 
-# UTF-8 Sanitize
 iconv -f UTF-8 -t UTF-8 -c "${MERGED_DUMP}" > "${MERGED_DUMP}.utf8" 2>/dev/null && \
   mv "${MERGED_DUMP}.utf8" "${MERGED_DUMP}" || true
 echo "   ✓ UTF-8 bereinigt"
 
 # -----------------------------------------------------------------------------
-# SCHRITT 2b — Block-Erkennung: Zeilen mit >= 2x literalem \n = >= 3 Teilzeilen
-# Extrahiert VOR Normalisierung. Ergebnis: NUL-separiert in BLOCKS_RAW.
+# SCHRITT 2b — Block-Erkennung
 # -----------------------------------------------------------------------------
 echo "   → Blöcke erkennen (>= ${MIN_BLOCK_LINES} Zeilen)..."
 
@@ -232,7 +238,7 @@ print(len(blocks))
 echo "   ✓ Blöcke (>= ${MIN_BLOCK_LINES} Zeilen): ${BLOCK_COUNT}"
 
 # -----------------------------------------------------------------------------
-# SCHRITT 2c — Normalisierung der Einzelzeilen (alle ohne >=2x \n)
+# SCHRITT 2c — Normalisierung Einzelzeilen
 # -----------------------------------------------------------------------------
 echo "   → Normalisierung Einzelzeilen..."
 
@@ -268,10 +274,6 @@ echo "   ✓ Einzelzeilen: ${SINGLES_COUNT}"
 
 # -----------------------------------------------------------------------------
 # SCHRITT 3 — Secret-Erkennung
-# False-Positives gefiltert:
-#   - ssh/scp mit -p PORT (Portnummer, kein Passwort)
-#   - UUID-Pfade (~/.zsh_sessions/UUID.historynew)
-#   - Dateinamen mit Ziffernblöcken (z.B. SelectedContributions20260222_2123)
 # -----------------------------------------------------------------------------
 echo ""
 echo "🔐 SCHRITT 3 — Secret-Erkennung"
@@ -295,20 +297,16 @@ SECRET_PATTERNS = [
     r'(?i)curl.*-u\s+\w+:\S+',
     r'(?i)(aws_access_key|aws_secret)',
 ]
-
-# Muster die False-Positives erzeugen
 FALSE_POSITIVE_PATTERNS = [
-    r'^ssh\s+',           # ssh -p PORT ist kein Passwort
-    r'^scp\s+',           # scp -P PORT ist kein Passwort
-    r'^\.zsh_sessions/',  # UUID-Pfade
-    r'historynew$',       # Session-Dateipfade
+    r'^ssh\s+',
+    r'^scp\s+',
+    r'^\.zsh_sessions/',
+    r'historynew$',
 ]
-
-# Token-Whitelist: Tokens die trotz hoher Entropie keine Secrets sind
 TOKEN_WHITELIST = [
-    r'^[A-Z0-9]{8}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{12}$',  # UUID
-    r'[0-9]{8}',   # Datumsstempel (20260222)
-    r'^[A-Za-z]+[0-9]{4,}',  # Dateiname mit Datum (SelectedContributions20260222)
+    r'^[A-Z0-9]{8}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{12}$',
+    r'[0-9]{8}',
+    r'^[A-Za-z]+[0-9]{4,}',
 ]
 
 try:
@@ -319,24 +317,16 @@ except:
 for line in lines:
     line = line.rstrip()
     if not line or len(line) < 10: continue
-
-    # False-Positive Check: ganze Zeile
-    is_fp = any(re.search(p, line) for p in FALSE_POSITIVE_PATTERNS)
-    if is_fp:
-        continue
-
+    if any(re.search(p, line) for p in FALSE_POSITIVE_PATTERNS): continue
     matched = False
     for pat in SECRET_PATTERNS:
         if re.search(pat, line):
             print(f'[PATTERN] {line[:200]}')
             matched = True
             break
-
     if not matched:
         for tok in re.findall(r'[A-Za-z0-9+/=_\-]{20,}', line):
-            # Token-Whitelist
-            if any(re.search(wp, tok) for wp in TOKEN_WHITELIST):
-                continue
+            if any(re.search(wp, tok) for wp in TOKEN_WHITELIST): continue
             if shannon_entropy(tok) > 4.2:
                 print(f'[ENTROPY] {line[:200]}')
                 break
@@ -379,94 +369,156 @@ fi
 # -----------------------------------------------------------------------------
 # SCHRITT 5 — Interaktive Block-Extraktion
 #
-# WICHTIG: set -e wird hier temporär deaktiviert!
-# "read -d $'\0'" liefert Exit-Code 1 beim letzten Block (EOF ohne NUL),
-# was mit set -eo pipefail das Script sofort abbricht.
+# [m] = nächste 10 Zeilen inline (wiederholbar, kein Pager)
+# [M] = less über /dev/tty (less liest + schreibt direkt aufs Terminal,
+#        kein stdin/stdout-Konflikt, man kommt mit q zurück)
+# DRY-RUN: volle Interaktion, aber kein Schreiben auf Disk
+# set +e nötig: read -d $'\0' gibt Exit 1 am letzten Block
 # -----------------------------------------------------------------------------
 if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
   echo ""
   echo "📦 SCHRITT 5 — Mehrzeilige Blöcke extrahieren"
+  [[ "${DRY_RUN}" == 1 ]] && echo "   ⚠️  DRY-RUN: Aktionen werden simuliert, nichts geschrieben"
   echo "   Blöcke mit >= ${MIN_BLOCK_LINES} Zeilen: ${BLOCK_COUNT}"
   echo ""
 
   BLOCK_IDX=0
   EXTRACTED_COUNT=0
   DELETED_COUNT=0
+  KEPT_COUNT=0
 
-  set +e  # read -d NUL liefert Exit 1 am Ende — darf den Loop nicht abbrechen
+  # Hilfsfunktion: Block-Header + erste N Zeilen ausgeben
+  # Argumente: $1=BLOCK_DISPLAY $2=BLOCK_LINES $3=BLOCK_IDX $4=BLOCK_COUNT $5=ab_zeile (0-basiert)
+  _show_block_lines() {
+    local display="$1" total_lines="$2" idx="$3" total_blocks="$4" from_line="$5"
+    local preview_count=10
+    local show_from=$(( from_line + 1 ))   # 1-basiert für Anzeige
+    local show_to=$(( from_line + preview_count ))
+    [[ ${show_to} -gt ${total_lines} ]] && show_to=${total_lines}
+    echo "   +----------------------------------------------------------+"
+    printf "   |  Block [%d/%d]  —  %d Zeilen total  (Zeilen %d–%d)\n" \
+      "${idx}" "${total_blocks}" "${total_lines}" "${show_from}" "${show_to}"
+    echo "   +----------------------------------------------------------+"
+    printf '%s\n' "${display}" \
+      | tail -n +$(( from_line + 1 )) \
+      | head -n ${preview_count} \
+      | while IFS= read -r ln; do
+          printf "   | %.88s\n" "${ln}"
+        done
+    if [[ ${show_to} -lt ${total_lines} ]]; then
+      echo "   | ... (noch $(( total_lines - show_to )) Zeilen)"
+    fi
+    echo "   +----------------------------------------------------------+"
+  }
+
+  set +e
   exec 3< "${BLOCKS_RAW}"
   while IFS= read -r -d $'\0' BLOCK_RAW <&3; do
     [[ -z "${BLOCK_RAW// }" ]] && continue
 
-    # Literales \n → echter Newline für Anzeige + Script
     BLOCK_DISPLAY=$(printf '%s' "${BLOCK_RAW}" | LC_ALL=C sed 's/\\n/\n/g')
     BLOCK_LINES=$(printf '%s' "${BLOCK_DISPLAY}" | wc -l | tr -d ' ')
     [[ "${BLOCK_LINES}" -lt "${MIN_BLOCK_LINES}" ]] && continue
 
-    BLOCK_IDX=$((BLOCK_IDX + 1))
+    BLOCK_IDX=$(( BLOCK_IDX + 1 ))
     SUGGESTED=$(_derive_script_name "${BLOCK_RAW}")
+    PREVIEW_FROM=0   # wie viele Zeilen schon gezeigt
 
-    echo "   +----------------------------------------------------------+"
-    printf "   |  [%d/%d]  %d Zeilen\n" "${BLOCK_IDX}" "${BLOCK_COUNT}" "${BLOCK_LINES}"
-    echo "   +----------------------------------------------------------+"
-    printf '%s\n' "${BLOCK_DISPLAY}" | head -3 | while IFS= read -r ln; do
-      printf "   %.90s\n" "${ln}"
-    done
-    [[ "${BLOCK_LINES}" -gt 3 ]] && echo "   ... (${BLOCK_LINES} Zeilen gesamt)"
+    # Erste Vorschau
+    _show_block_lines "${BLOCK_DISPLAY}" "${BLOCK_LINES}" \
+      "${BLOCK_IDX}" "${BLOCK_COUNT}" "${PREVIEW_FROM}"
+    PREVIEW_FROM=3   # nach Header nächstes [m] startet ab Zeile 3
     echo ""
-    echo "   [s] Als Script   [i] In History behalten   [d] Löschen"
-    echo "   [m] In less anzeigen                        [q] Abbrechen"
-    ask ACTION "   Aktion [s]: "
-    ACTION="${ACTION:-s}"
 
-    if [[ "${ACTION}" == "m" || "${ACTION}" == "M" ]]; then
-      printf '%s\n' "${BLOCK_DISPLAY}" | less </dev/tty >/dev/tty 2>/dev/null || \
-        printf '%s\n' "${BLOCK_DISPLAY}" | more </dev/tty >/dev/tty 2>/dev/null || true
-      echo ""
-      echo "   [s] Als Script   [i] In History behalten   [d] Löschen   [q] Abbrechen"
+    # Aktions-Schleife: bleibt im Block bis echte Entscheidung
+    while true; do
+      echo "   [s] Script  [i] Behalten  [d] Löschen  [m] +10 Zeilen  [M] less  [q] Stop"
       ask ACTION "   Aktion [s]: "
       ACTION="${ACTION:-s}"
-    fi
 
-    case "${ACTION}" in
-      s|S)
-        ask SNAME "   Name [${SUGGESTED}]: "
-        SNAME="${SNAME:-${SUGGESTED}}"
-        [[ "${SNAME}" != *.sh ]] && SNAME="${SNAME}.sh"
-        [[ ! "${SNAME}" =~ ^[0-9]{8}_ ]] && SNAME="$(date +%Y%m%d)_${SNAME}"
-        SPATH="${SCRIPTS_DIR}/${SNAME}"
-        if [[ "${DRY_RUN}" == 1 ]]; then
-          echo "   [DRY-RUN] Würde speichern: ${SPATH}"
-        else
-          printf '#!/usr/bin/env zsh\n# Extracted: %s\n# From: zsh history cleanup\n# ---\n\n%s\n' \
-            "$(date '+%Y-%m-%d %H:%M')" "${BLOCK_DISPLAY}" > "${SPATH}"
-          chmod +x "${SPATH}"
-          git -C "${SCRIPTS_DIR}" add "${SNAME}" 2>/dev/null || true
-          git -C "${SCRIPTS_DIR}" commit -m "extract: ${SNAME}" --quiet 2>/dev/null || true
-          echo "   ✓ Gespeichert: ${SPATH}"
-          EXTRACTED_COUNT=$((EXTRACTED_COUNT + 1))
-        fi
-        ;;
-      d|D)
-        echo "   → Gelöscht"
-        DELETED_COUNT=$((DELETED_COUNT + 1))
-        ;;
-      q|Q)
-        echo "   → Abgebrochen"
-        break
-        ;;
-      *)
-        # [i]: Block-Zeilen zurück in SINGLES_FILE (für History)
-        printf '%s\n' "${BLOCK_DISPLAY}" >> "${SINGLES_FILE}"
-        echo "   → Behalten"
-        ;;
-    esac
-    echo ""
+      case "${ACTION}" in
+
+        m|m)
+          # Nächste 10 Zeilen inline
+          if [[ ${PREVIEW_FROM} -ge ${BLOCK_LINES} ]]; then
+            echo "   (alle ${BLOCK_LINES} Zeilen bereits gezeigt)"
+          else
+            _show_block_lines "${BLOCK_DISPLAY}" "${BLOCK_LINES}" \
+              "${BLOCK_IDX}" "${BLOCK_COUNT}" "${PREVIEW_FROM}"
+            PREVIEW_FROM=$(( PREVIEW_FROM + 10 ))
+          fi
+          echo ""
+          continue
+          ;;
+
+        M)
+          # less mit direktem tty-Zugriff — kein stdin/stdout-Mix
+          # less bekommt die Datei als Argument (nicht per Pipe),
+          # tty für Tastatur-Input wird über LESSSECURE nicht blockiert.
+          _LESS_TMP="/tmp/zsh_hist_block_less_${TIMESTAMP}_${BLOCK_IDX}.txt"
+          printf '%s\n' "${BLOCK_DISPLAY}" > "${_LESS_TMP}"
+          less "${_LESS_TMP}" < /dev/tty > /dev/tty 2>/dev/tty
+          rm -f "${_LESS_TMP}"
+          echo ""
+          continue
+          ;;
+
+        s|S)
+          ask SNAME "   Name [${SUGGESTED}]: "
+          SNAME="${SNAME:-${SUGGESTED}}"
+          [[ "${SNAME}" != *.sh ]] && SNAME="${SNAME}.sh"
+          [[ ! "${SNAME}" =~ ^[0-9]{8}_ ]] && SNAME="$(date +%Y%m%d)_${SNAME}"
+          SPATH="${SCRIPTS_DIR}/${SNAME}"
+          if [[ "${DRY_RUN}" == 1 ]]; then
+            echo "   [DRY-RUN] Würde speichern: ${SPATH}"
+          else
+            printf '#!/usr/bin/env zsh\n# Extracted: %s\n# From: zsh history cleanup\n# ---\n\n%s\n' \
+              "$(date '+%Y-%m-%d %H:%M')" "${BLOCK_DISPLAY}" > "${SPATH}"
+            chmod +x "${SPATH}"
+            git -C "${SCRIPTS_DIR}" add "${SNAME}" 2>/dev/null || true
+            git -C "${SCRIPTS_DIR}" commit -m "extract: ${SNAME}" --quiet 2>/dev/null || true
+            echo "   ✓ Gespeichert: ${SPATH}"
+          fi
+          EXTRACTED_COUNT=$(( EXTRACTED_COUNT + 1 ))
+          echo ""
+          break
+          ;;
+
+        d|D)
+          echo "   → Gelöscht"
+          DELETED_COUNT=$(( DELETED_COUNT + 1 ))
+          echo ""
+          break
+          ;;
+
+        q|Q)
+          echo "   → Abgebrochen (restliche Blöcke übersprungen)"
+          BLOCK_IDX=${BLOCK_COUNT}   # verhindert weitere Iterationen
+          break 2
+          ;;
+
+        *)
+          # [i]: Block in SINGLES_FILE zurück (für History)
+          if [[ "${DRY_RUN}" == 1 ]]; then
+            echo "   [DRY-RUN] Würde in History behalten"
+          else
+            printf '%s\n' "${BLOCK_DISPLAY}" >> "${SINGLES_FILE}"
+          fi
+          echo "   → In History behalten"
+          KEPT_COUNT=$(( KEPT_COUNT + 1 ))
+          echo ""
+          break
+          ;;
+
+      esac
+    done
+
   done
   exec 3<&-
-  set -e  # set -e wieder aktivieren
+  set -e
 
-  echo "   ✓ Extrahiert: ${EXTRACTED_COUNT}  |  Gelöscht: ${DELETED_COUNT}"
+  echo "   ✓ Script: ${EXTRACTED_COUNT}  |  Löschen: ${DELETED_COUNT}  |  Behalten: ${KEPT_COUNT}"
+
 else
   [[ "${SKIP_EXTRACT}" == 1 ]] && echo "" && echo "   → Schritt 5 übersprungen (--skip-extract)"
   [[ "${BLOCK_COUNT}" -eq 0 ]] && echo "" && echo "   ℹ️  Keine Blöcke >= ${MIN_BLOCK_LINES} Zeilen"
@@ -506,7 +558,7 @@ if [[ "${DRY_RUN}" == 1 ]]; then
   echo "   [DRY-RUN] Würde ${CLEAN_COUNT} Einträge nach ${HISTFILE} schreiben"
   echo "   [DRY-RUN] Preview (letzte 10):"
   tail -10 "${CLEAN_FILE}" | sed 's/^/     /'
-  echo "   [DRY-RUN] Keine Änderungen."
+  echo "   [DRY-RUN] Keine Änderungen geschrieben."
 else
   ask CONFIRM "   Jetzt ${CLEAN_COUNT} Einträge in ${HISTFILE} schreiben? [J/n] "
   if [[ "${CONFIRM}" == "n" || "${CONFIRM}" == "N" ]]; then
@@ -525,7 +577,8 @@ fi
 
 rm -f "${MERGED_DUMP}" "${BLOCKS_RAW}" "${SINGLES_FILE}" \
       "${CLEAN_FILE}" "${SECRET_FILE}" "${ENTRIES_TO_DELETE}" \
-      "/tmp/zsh_hist_filtered_${TIMESTAMP}.txt" 2>/dev/null || true
+      "/tmp/zsh_hist_filtered_${TIMESTAMP}.txt" \
+      /tmp/zsh_hist_block_less_${TIMESTAMP}_*.txt 2>/dev/null || true
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
