@@ -1,0 +1,10 @@
+# Keine echten History-Dateien ins Repo
+*.bak
+*.live
+*.clean
+*.tmp
+tmp/
+
+# Keine persönlichen History-Exports
+history-export-*.txt
+history-dump-*.txt
