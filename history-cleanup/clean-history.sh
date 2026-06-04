@@ -20,6 +20,8 @@
 # AppleScript fc -W (Schritt 1.5):
 #   Schickt fc -W an alle idle Terminal.app Tabs (busy=false).
 #   Tabs mit laufendem Prozess werden übersprungen (kein Chaos in stdin).
+#   ⚠️  ALLE anderen Tabs müssen leere Eingabezeile haben (kein halbfertiger
+#       Befehl) — sonst wird fc -W direkt angehängt → fehlerhafter Befehl!
 #   Funktioniert nur mit Terminal.app — für iTerm2 etc. manuell fc -W eingeben.
 #   Benötigt Accessibility-Rechte (Einstellungen > Datenschutz > Bedienungshilfen).
 # =============================================================================
@@ -119,6 +121,16 @@ echo ""
 echo "   Soll fc -W via AppleScript an alle anderen idle Terminal.app"
 echo "   Fenster/Tabs geschickt werden? (Tabs mit laufendem Prozess"
 echo "   werden automatisch übersprungen.)"
+echo ""
+echo "   ┌─────────────────────────────────────────────────────────┐"
+echo "   │  ⚠️  VORAUSSETZUNG: Alle anderen Terminal-Tabs müssen   │"
+echo "   │  eine LEERE Eingabezeile haben (kein halbfertiger       │"
+echo "   │  Befehl!). Sonst wird fc -W direkt angehängt und        │"
+echo "   │  verursacht einen Fehler (z.B. «fc: bad option: -c»).   │"
+echo "   │                                                         │"
+echo "   │  Falls nicht sicher: [n] wählen und manuell             │"
+echo "   │  'fc -W' in jedem anderen Tab eingeben.                 │"
+echo "   └─────────────────────────────────────────────────────────┘"
 echo ""
 echo "   Voraussetzung: Terminal.app hat Accessibility-Rechte"
 echo "   (Einstellungen > Datenschutz > Bedienungshilfen)"
