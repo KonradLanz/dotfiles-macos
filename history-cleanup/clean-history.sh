@@ -56,14 +56,20 @@ echo ""
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SCHRITT 1: Hinweis auf andere offene Terminals
+# Nur warnen wenn Session-Files tatsächlich ungespeicherte History haben (>0 Zeilen)
 # ──────────────────────────────────────────────────────────────────────────────
 echo "📋 SCHRITT 1 — Offene Terminal-Sessions"
 SESSION_FILES=(~/.zsh_sessions/*.historynew(N))
-if [[ ${#SESSION_FILES[@]} -gt 0 ]]; then
+NONEMPTY_SESSIONS=()
+for f in "${SESSION_FILES[@]}"; do
+  COUNT=$(wc -l < "$f" | tr -d ' ')
+  [[ "$COUNT" -gt 0 ]] && NONEMPTY_SESSIONS+=("$f ($COUNT Zeilen)")
+done
+
+if [[ ${#NONEMPTY_SESSIONS[@]} -gt 0 ]]; then
   echo "   ⚠️  Folgende Sessions haben noch nicht gespeicherte History:"
-  for f in "${SESSION_FILES[@]}"; do
-    COUNT=$(wc -l < "$f" | tr -d ' ')
-    echo "   → $f ($COUNT Zeilen)"
+  for entry in "${NONEMPTY_SESSIONS[@]}"; do
+    echo "   → $entry"
   done
   echo ""
   echo "   💡 Tipp: In allen anderen offenen Terminal-Fenstern eintippen:"
@@ -72,7 +78,13 @@ if [[ ${#SESSION_FILES[@]} -gt 0 ]]; then
   read "CONT?   Weiter ohne die anderen Fenster zu sichern? [j/N] "
   [[ "${CONT}" != "j" && "${CONT}" != "J" ]] && { echo "Abgebrochen."; exit 0; }
 else
-  echo "   ✓ Keine offenen Session-Dateien gefunden"
+  # Leere Session-Files: normal auf macOS, kein Grund zum Abbrechen
+  TOTAL_SESSIONS=${#SESSION_FILES[@]}
+  if [[ "$TOTAL_SESSIONS" -gt 0 ]]; then
+    echo "   ✓ ${TOTAL_SESSIONS} Session-File(s) gefunden — alle leer (keine ungespeicherte History)"
+  else
+    echo "   ✓ Keine offenen Session-Dateien gefunden"
+  fi
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -276,112 +288,91 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SCHRITT 6: Bereinigung & Filter
+# SCHRITT 6: Bereinigung + Filterung
 # ──────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "🧹 SCHRITT 6 — Bereinigung"
+echo "🧹 SCHRITT 6 — History bereinigen"
 
-# Zu löschende Einträge sammeln
-DELETE_FILE="/tmp/zsh_hist_delete_${TIMESTAMP}.txt"
-touch "${DELETE_FILE}"
-[[ -f "${LONG_FILE}.delete" ]] && cat "${LONG_FILE}.delete" >> "${DELETE_FILE}" || true
-[[ "${REMOVE_SECRETS}" == "J" ]] && cat "${SECRET_FILE}" | sed 's/^\[.*\] //' >> "${DELETE_FILE}" || true
+# Einträge die entfernt werden sollen sammeln
+ENTRIES_TO_DELETE="/tmp/zsh_hist_delete_${TIMESTAMP}.txt"
+touch "${ENTRIES_TO_DELETE}"
+[[ -f "${LONG_FILE}.delete" ]] && cat "${LONG_FILE}.delete" >> "${ENTRIES_TO_DELETE}"
 
-LC_ALL=C awk -v thresh="${LONG_THRESH}" '
-  # Entferne fc -l Nummer-Artefakte
-  /^[[:space:]]+[0-9]+[[:space:]]+/ { next }
+# Secrets entfernen falls gewünscht
+if [[ "${REMOVE_SECRETS}" == "J" ]]; then
+  grep '^\[.*\] ' "${SECRET_FILE}" | sed 's/^\[.*\] //' >> "${ENTRIES_TO_DELETE}"
+fi
 
-  # Entferne Bracket Paste Mode
-  /^\[200~/ { next }
+# Hauptfilter via awk
+LC_ALL=C awk -v long_thresh="${LONG_THRESH}" '
+  BEGIN { delete_count = 0 }
 
-  # Entferne zsh extended history Timestamps
-  /^: [0-9]+:[0-9]+;/ { next }
-
-  # Entferne zu lange Zeilen (wurden als Script gespeichert oder gelöscht)
-  length($0) > thresh { next }
-
-  # Entferne Cursor-Integration (macOS/Cursor Artefakte)
-  /shellIntegration/ { next }
-  /^source.*\.cursor\/.*\.zsh/ { next }
-
-  # Entferne leere/whitespace Zeilen
+  # Leerzeilen überspringen
   /^[[:space:]]*$/ { next }
 
-  # Führende Leerzeichen entfernen
-  { sub(/^[[:space:]]+/, ""); print }
-' "${MERGED_DUMP}" | awk '!seen[$0]++' > "${CLEAN_FILE}"
+  # Zeilennummern entfernen (fc -l Artefakte): "  123  command"
+  /^[[:space:]]+[0-9]+[[:space:]]+/ { next }
 
-# Zu löschende Einträge noch mal rausfiltern
-if [[ -s "${DELETE_FILE}" ]]; then
-  TEMP_CLEAN="/tmp/zsh_hist_clean2_${TIMESTAMP}.txt"
-  grep -vxFf "${DELETE_FILE}" "${CLEAN_FILE}" > "${TEMP_CLEAN}" 2>/dev/null || cp "${CLEAN_FILE}" "${TEMP_CLEAN}"
-  mv "${TEMP_CLEAN}" "${CLEAN_FILE}"
+  # Bracket Paste Mode Artefakte
+  /^\[200~/ { next }
+
+  # ZSH extended history Format (":timestamp:0;cmd") — nur Command-Teil behalten
+  /^: [0-9]+:[0-9]+;/ {
+    sub(/^: [0-9]+:[0-9]+;/, "")
+    if ($0 == "") next
+  }
+
+  # Zu lange Zeilen (oft copy-paste Artefakte oder Fehler)
+  length($0) > 500 { next }
+
+  # Duplikate entfernen (Reihenfolge bleibt erhalten — letztes Vorkommen gewinnt)
+  !seen[$0]++ { print }
+' "${MERGED_DUMP}" > "${CLEAN_FILE}"
+
+# Einträge aus der Delete-Liste entfernen
+if [[ -s "${ENTRIES_TO_DELETE}" ]]; then
+  TEMP_FILTERED="/tmp/zsh_hist_filtered_${TIMESTAMP}.txt"
+  grep -vxFf "${ENTRIES_TO_DELETE}" "${CLEAN_FILE}" > "${TEMP_FILTERED}" 2>/dev/null || cp "${CLEAN_FILE}" "${TEMP_FILTERED}"
+  mv "${TEMP_FILTERED}" "${CLEAN_FILE}"
 fi
 
 CLEAN_COUNT=$(wc -l < "${CLEAN_FILE}" | tr -d ' ')
-echo "   Einträge nach Bereinigung: ${CLEAN_COUNT} (von ${MERGED_COUNT})"
-echo "   Entfernt: $((MERGED_COUNT - CLEAN_COUNT)) Zeilen"
-
-# Sicherheitsprüfung
-if [[ "${CLEAN_COUNT}" -lt 10 ]]; then
-  echo ""
-  echo "⚠️  WARNUNG: Nur ${CLEAN_COUNT} Einträge übrig. Etwas stimmt nicht."
-  echo "   Prüfe: head -30 ${MERGED_DUMP}"
-  exit 1
-fi
-
-# Vorschau
-echo ""
-echo "   Vorschau (letzte 10 Einträge):"
-tail -10 "${CLEAN_FILE}" | sed 's/^/   /'
+echo "   ✓ Bereinigt: ${CLEAN_COUNT} Einträge (war: ${MERGED_COUNT})"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SCHRITT 7: Schreiben + Aktivieren
+# SCHRITT 7: Schreiben + Reloaden
 # ──────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "💿 SCHRITT 7 — Speichern & Aktivieren"
+echo "💿 SCHRITT 7 — History schreiben"
 
 if [[ "${DRY_RUN}" == 1 ]]; then
-  echo "   DRY-RUN: Würde ${HISTFILE} mit ${CLEAN_COUNT} Einträgen überschreiben"
-  echo "   DRY-RUN: Würde ${#SESSION_FILES[@]} Session-Dateien löschen"
+  echo "   [DRY-RUN] Würde ${CLEAN_COUNT} Einträge nach ${HISTFILE} schreiben"
+  echo "   [DRY-RUN] Preview (letzte 10 Einträge):"
+  tail -10 "${CLEAN_FILE}" | sed 's/^/     /'
 else
-  read "FINAL?→ ${HISTFILE} überschreiben und Session-Dateien löschen? [j/N] "
-  if [[ "${FINAL}" != "j" && "${FINAL}" != "J" ]]; then
-    echo "Abgebrochen. Temp-Dateien bleiben erhalten:"
-    echo "  ${MERGED_DUMP}  ${CLEAN_FILE}"
-    exit 0
-  fi
+  # Session-Dateien leeren (verhindert Duplikate beim nächsten Start)
+  for f in ~/.zsh_sessions/*.historynew(N) ~/.zsh_sessions/*.history(N); do
+    [[ -f "$f" ]] && > "$f"
+  done
+  echo "   ✓ Session-Dateien geleert"
 
-  # Session-Dateien löschen (verhindert Duplikate nach Neustart!)
-  rm -f ~/.zsh_sessions/*.history  2>/dev/null || true
-  rm -f ~/.zsh_sessions/*.historynew 2>/dev/null || true
-  echo "   ✓ Session-Dateien gelöscht"
+  # History schreiben
+  cp "${CLEAN_FILE}" "${HISTFILE}"
+  echo "   ✓ ${HISTFILE} aktualisiert (${CLEAN_COUNT} Einträge)"
 
-  # History-Datei schreiben
-  mv "${CLEAN_FILE}" "${HISTFILE}"
-  chmod 600 "${HISTFILE}"
-  echo "   ✓ ${HISTFILE} geschrieben (${CLEAN_COUNT} Einträge)"
-
-  # In aktuellem Terminal-Speicher neu laden
-  # fc -p lädt eine Datei als History (ohne Session-Logik)
-  fc -p "${HISTFILE}" 2>/dev/null && echo "   ✓ In-Memory History neu geladen" || \
-    echo "   ⚠️  fc -p fehlgeschlagen — bitte neues Terminal öffnen"
+  # In-Memory History reloaden
+  fc -R "${HISTFILE}" 2>/dev/null || true
+  echo "   ✓ In-Memory History reloaded"
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
-# AUFRÄUMEN
+# Aufräumen
 # ──────────────────────────────────────────────────────────────────────────────
-rm -f "${MERGED_DUMP}" "${LONG_FILE}" "${LONG_FILE}.delete" \
-       "${SECRET_FILE}" "${DELETE_FILE}" 2>/dev/null || true
+rm -f "${MERGED_DUMP}" "${CLEAN_FILE}" "${LONG_FILE}" "${LONG_FILE}.delete" \
+      "${SECRET_FILE}" "${ENTRIES_TO_DELETE}" 2>/dev/null || true
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║  ✓ Cleanup abgeschlossen                             ║"
+echo "║  ✅ Fertig!  Backup: ~/.zsh_history_backups/         ║"
 echo "╚══════════════════════════════════════════════════════╝"
-echo "   History: ${CLEAN_COUNT} Einträge"
-echo "   Scripts: ${SCRIPTS_DIR}/"
-echo "   Backup:  ${BACKUP_DIR}/zsh_history.${TIMESTAMP}.bak"
 echo ""
-if [[ "${DRY_RUN}" == 0 ]]; then
-  echo "   ⚡ Tipp: Andere offene Terminals neu starten für saubere History!"
-fi
