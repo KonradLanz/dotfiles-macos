@@ -14,6 +14,7 @@
 #   Mehrzeiler aus fc-l Dumps: literales \n als Trennzeichen
 #
 # Normalisierungs-Pipeline (Schritt 2b):
+#   0. iconv -c  → invalides UTF-8 still entfernen (ESC-Reste, Paste-Müll)
 #   1. trailing \n entfernen (vermeidet Leerzeilen nach Split)
 #   2. literales \n → echter Zeilenumbruch
 #   3. Zeilennummer-Prefix entfernen ("   11  " → "")
@@ -75,18 +76,6 @@ for arg in "$@"; do
 done
 
 [[ "$DRY_RUN" == 1 ]] && echo "⚠️  DRY-RUN Modus: keine Änderungen werden gespeichert"
-
-# Rahmen-Hilfsfunktion: Zeile mit padding auf feste Breite bringen
-# Breite = 54 Zeichen innen (zwischen ║ und ║)
-_box_line() {
-  local text="$1"
-  local width=54
-  # Zeichen zählen (nicht Bytes) für korrekte Padding-Berechnung
-  local textlen=${#text}
-  local pad=$(( width - textlen ))
-  [[ $pad -lt 0 ]] && pad=0
-  printf "   ║  %s%${pad}s║\n" "${text}" ""
-}
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
@@ -269,6 +258,18 @@ if [[ "${MERGED_COUNT}" -eq 0 ]]; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SCHRITT 2a — UTF-8 Sanitize
+# iconv -c entfernt kaputte Bytefolgen still (ESC-Sequenzen, Bracket-Paste-
+# Reste, Encoding-Artefakte). Valides UTF-8 (Umlaute, Emoji, CJK) bleibt
+# vollständig erhalten. Danach brauchen cut/sort/awk kein LC_ALL=C Workaround.
+# ─────────────────────────────────────────────────────────────────────────────
+echo "   → UTF-8 Sanitize (iconv)..."
+iconv -f UTF-8 -t UTF-8 -c "${MERGED_DUMP}" > "${MERGED_DUMP}.utf8" && \
+  mv "${MERGED_DUMP}.utf8" "${MERGED_DUMP}" || \
+  echo "   ⚠️  iconv nicht verfügbar — weiter ohne Sanitize"
+echo "   ✓ UTF-8 bereinigt"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 2b — Normalisierung
 # ─────────────────────────────────────────────────────────────────────────────
 echo "   → Normalisierung..."
@@ -433,9 +434,9 @@ fi
 echo ""
 echo "📏 SCHRITT 3 — Lange Einträge analysieren (>${LONG_THRESH} Zeichen)"
 
-LC_ALL=C awk -v thresh="${LONG_THRESH}" '
+awk -v thresh="${LONG_THRESH}" '
   length($0) > thresh { print }
-' "${BLOCKS_FILE}" | LC_ALL=C sort -u > "${LONG_FILE}"
+' "${BLOCKS_FILE}" | sort -u > "${LONG_FILE}"
 
 LONG_COUNT=$(wc -l < "${LONG_FILE}" | tr -d ' ')
 echo "   Gefunden: ${LONG_COUNT} lange Einträge (>${LONG_THRESH} Zeichen)"
@@ -512,8 +513,7 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${LONG_COUNT}" -gt 0 ]]; then
   INDEX=0
   while IFS= read -r ENTRY; do
     INDEX=$((INDEX + 1))
-    # LC_ALL=C für cut → keine "Illegal byte sequence" bei non-ASCII
-    PREVIEW=$(echo "${ENTRY}" | LC_ALL=C cut -c1-80)
+    PREVIEW=$(echo "${ENTRY}" | cut -c1-80)
     echo ""
     echo "   [$INDEX/${LONG_COUNT}] (${#ENTRY} Zeichen)"
     echo "   ${PREVIEW}..."
@@ -524,7 +524,7 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${LONG_COUNT}" -gt 0 ]]; then
     case "${ACTION}" in
       s|S)
         DATE_PREFIX=$(date +%Y%m%d)
-        SUGGESTION=$(echo "${ENTRY}" | awk '{print $1}' | tr -cd 'a-z0-9_-' | LC_ALL=C cut -c1-20)
+        SUGGESTION=$(echo "${ENTRY}" | awk '{print $1}' | tr -cd 'a-z0-9_-' | cut -c1-20)
         SUGGESTION="${DATE_PREFIX}_${SUGGESTION}_script"
         echo -n "   Name [${SUGGESTION}]: "
         read SNAME
