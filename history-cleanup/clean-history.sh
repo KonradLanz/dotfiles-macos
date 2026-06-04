@@ -27,16 +27,17 @@
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 0 — Auto-Pull (Script immer aktuell halten)
+# Fix: ${(%):-%x} gibt den echten Pfad des laufenden Scripts zurück,
+#      unabhängig vom CWD wo der Aufruf stattfindet.
 # ─────────────────────────────────────────────────────────────────────────────
-_SCRIPT_DIR="${0:A:h}"
+_SCRIPT_DIR="${${(%):-%x}:A:h}"
 if [[ -d "${_SCRIPT_DIR}/../.git" ]]; then
-  _PULL_OUT=$(git -C "${_SCRIPT_DIR}" pull --ff-only --quiet 2>&1)
+  _PULL_OUT=$(git -C "${_SCRIPT_DIR}/.." pull --ff-only --quiet 2>&1)
   _PULL_RC=$?
   if [[ ${_PULL_RC} -eq 0 ]]; then
     if [[ -n "${_PULL_OUT}" ]]; then
       echo "🔄 Script aktualisiert (git pull)"
     fi
-    # Stilles Enter-Durchentern: kein Output wenn bereits aktuell
   else
     echo "⚠️  git pull fehlgeschlagen (offline oder Konflikt) — lokale Version wird verwendet"
   fi
@@ -75,9 +76,21 @@ done
 
 [[ "$DRY_RUN" == 1 ]] && echo "⚠️  DRY-RUN Modus: keine Änderungen werden gespeichert"
 
+# Rahmen-Hilfsfunktion: Zeile mit padding auf feste Breite bringen
+# Breite = 54 Zeichen innen (zwischen ║ und ║)
+_box_line() {
+  local text="$1"
+  local width=54
+  # Zeichen zählen (nicht Bytes) für korrekte Padding-Berechnung
+  local textlen=${#text}
+  local pad=$(( width - textlen ))
+  [[ $pad -lt 0 ]] && pad=0
+  printf "   ║  %s%${pad}s║\n" "${text}" ""
+}
+
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║         ZSH History Cleanup — $(date '+%Y-%m-%d %H:%M')        ║"
+printf "║         ZSH History Cleanup — %-22s║\n" "$(date '+%Y-%m-%d %H:%M')       "
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
 
@@ -106,10 +119,11 @@ else
   echo ""
 
   if [[ $HAS_RAM_SESSIONS -eq 1 ]]; then
-    echo "   ╔─────────────────────────────────────────────────────╗"
-    echo "   ║  ⚡ DIESES Terminal hat RAM-History (0 auf Disk)    ║"
-    echo "   ║  → fc -ln liest sie direkt → NICHTS geht verloren  ║"
-    echo "   ╚─────────────────────────────────────────────────────╝"
+    echo "   ╔──────────────────────────────────────────────────╗"
+    echo "   ║  ⚡ DIESES Terminal hat RAM-History (0 auf Disk) ║"
+    echo "   ║  → fc -ln liest sie direkt → NICHTS geht        ║"
+    echo "   ║    verloren                                      ║"
+    echo "   ╚──────────────────────────────────────────────────╝"
   else
     echo "   ✓ Alle Sessions haben ihren RAM bereits auf Disk geschrieben"
   fi
@@ -257,13 +271,6 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 2b — Normalisierung
 # ─────────────────────────────────────────────────────────────────────────────
-# Pipeline:
-#   1. trailing \n entfernen  →  kein Leerzeilen-Artefakt nach Split
-#   2. literales \n → echter Zeilenumbruch
-#   3. Zeilennummer-Prefix ("   11  ") entfernen
-#   4. zsh extended history Prefix (": 123:0;") entfernen
-#   5. Leerzeilen weg
-# ─────────────────────────────────────────────────────────────────────────────
 echo "   → Normalisierung..."
 
 LC_ALL=C sed 's/\\n$//' "${MERGED_DUMP}" \
@@ -288,10 +295,10 @@ echo "   ✓ Normalisiert: ${NORM_COUNT} Zeilen"
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 2c — Backslash-Continuation Blöcke extrahieren
 # ─────────────────────────────────────────────────────────────────────────────
-# Blöcke erkennen: Zeile endet auf \ → sammeln bis Leerzeile oder Zeile ohne \
-# Blöcke → automatisch nach ~/scripts/ (mit abgeleitetem Namen)
-# Plain Zeilen → BLOCKS_FILE (Basis für Schritt 3–6)
-# Block-Zählung: awk-basiert (macOS tr kennt kein NUL-counting zuverlässig)
+# Blöcke: Zeile endet auf \ → sammeln bis Leerzeile oder Zeile ohne \
+# Ausgabe: NUL-separierte Blöcke in .raw, plain Zeilen in BLOCKS_FILE
+# Block-Zählung: via python3 (macOS awk \x00-Matching unzuverlässig)
+# Block-Loop: liest .raw über fd 3 → stdin bleibt frei für interactive read
 # ─────────────────────────────────────────────────────────────────────────────
 echo "   → Blöcke erkennen..."
 mkdir -p "${SCRIPTS_DIR}"
@@ -301,26 +308,19 @@ if [[ ! -d "${SCRIPTS_DIR}/.git" ]]; then
   git -C "${SCRIPTS_DIR}" init --quiet
 fi
 
-# Hilfsfunktion: Script-Name aus Block-Inhalt ableiten
-# Priorität: erste Kommentarzeile → erstes Wort → Timestamp-Fallback
 _derive_script_name() {
   local block="$1"
   local date_prefix=$(date +%Y%m%d)
   local name=""
-
-  # Erste Kommentarzeile (# ...) suchen
   name=$(echo "${block}" | grep '^#' | head -1 | sed 's/^#[[:space:]]*//' | tr ' ' '-' | tr -cd 'a-z0-9-' | cut -c1-30)
-
-  # Fallback: erstes Wort des ersten Befehls
   if [[ -z "${name}" ]]; then
     name=$(echo "${block}" | grep -v '^#' | head -1 | awk '{print $1}' | tr -cd 'a-z0-9_-' | cut -c1-20)
   fi
-
   [[ -z "${name}" ]] && name="script"
   echo "${date_prefix}_${name}"
 }
 
-# Blöcke als NUL-separiert in .raw, plain Zeilen in BLOCKS_FILE
+# Blöcke → .raw (NUL-separiert), plain Zeilen → BLOCKS_FILE
 LC_ALL=C awk '
 /\\$/ {
   sub(/\\$/, "")
@@ -354,8 +354,13 @@ LC_ALL=C awk '
 }
 ' "${NORM_DUMP}" > "${BLOCKS_FILE}"
 
-# Block-Zählung macOS-kompatibel via awk (kein tr NUL-counting)
-BLOCK_COUNT=$(LC_ALL=C awk 'BEGIN{n=0} /\x00/{n++} END{print n}' "${BLOCKS_FILE}.raw")
+# Block-Zählung via python3 — macOS awk \x00 unzuverlässig
+BLOCK_COUNT=$(python3 -c "
+import sys
+data = open('${BLOCKS_FILE}.raw', 'rb').read()
+print(data.count(b'\\x00'))
+" 2>/dev/null || echo 0)
+
 PLAIN_COUNT=$(wc -l < "${BLOCKS_FILE}" | tr -d ' ')
 echo "   ✓ Blöcke erkannt: ${BLOCK_COUNT} (→ ~/scripts/)"
 echo "   ✓ Einzelzeilen:   ${PLAIN_COUNT}"
@@ -366,7 +371,9 @@ if [[ "${BLOCK_COUNT}" -gt 0 && "${SKIP_EXTRACT}" == 0 ]]; then
   echo ""
 
   BLOCK_IDX=0
-  while IFS= read -r -d $'\0' BLOCK; do
+  # fd 3 → stdin bleibt frei für read (interaktive Eingabe im Loop)
+  exec 3< "${BLOCKS_FILE}.raw"
+  while IFS= read -r -d $'\0' BLOCK <&3; do
     BLOCK_IDX=$((BLOCK_IDX + 1))
     SUGGESTED=$(_derive_script_name "${BLOCK}")
     PREVIEW=$(echo "${BLOCK}" | head -3)
@@ -416,7 +423,8 @@ if [[ "${BLOCK_COUNT}" -gt 0 && "${SKIP_EXTRACT}" == 0 ]]; then
       echo "   ✓ Gespeichert + committed: ${SPATH}"
     fi
     echo ""
-  done < "${BLOCKS_FILE}.raw"
+  done
+  exec 3<&-
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -504,7 +512,8 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${LONG_COUNT}" -gt 0 ]]; then
   INDEX=0
   while IFS= read -r ENTRY; do
     INDEX=$((INDEX + 1))
-    PREVIEW=$(echo "${ENTRY}" | cut -c1-80)
+    # LC_ALL=C für cut → keine "Illegal byte sequence" bei non-ASCII
+    PREVIEW=$(echo "${ENTRY}" | LC_ALL=C cut -c1-80)
     echo ""
     echo "   [$INDEX/${LONG_COUNT}] (${#ENTRY} Zeichen)"
     echo "   ${PREVIEW}..."
@@ -515,7 +524,7 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${LONG_COUNT}" -gt 0 ]]; then
     case "${ACTION}" in
       s|S)
         DATE_PREFIX=$(date +%Y%m%d)
-        SUGGESTION=$(echo "${ENTRY}" | awk '{print $1}' | tr -cd 'a-z0-9_-' | cut -c1-20)
+        SUGGESTION=$(echo "${ENTRY}" | awk '{print $1}' | tr -cd 'a-z0-9_-' | LC_ALL=C cut -c1-20)
         SUGGESTION="${DATE_PREFIX}_${SUGGESTION}_script"
         echo -n "   Name [${SUGGESTION}]: "
         read SNAME
