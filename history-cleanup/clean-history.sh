@@ -1,6 +1,6 @@
 #!/usr/bin/env zsh
 # =============================================================================
-# clean-history.sh — ZSH History Cleanup + Long-Entry Extractor + Secret Detector
+# clean-history.sh — ZSH History Cleanup + Multi-Line Block Extractor + Secret Detector
 # =============================================================================
 # Usage:
 #   zsh ~/git/dotfiles-macos/history-cleanup/clean-history.sh
@@ -20,7 +20,11 @@
 #   3. Zeilennummer-Prefix entfernen ("   11  " → "")
 #   4. zsh extended history Prefix entfernen (": 123:0;" → "")
 #   5. Zeilen die nur aus Unicode-Combining/Steuerzeichen bestehen entfernen
-#   6. Backslash-Continuation Blöcke → auto in ~/scripts/ extrahieren
+#
+# Schritt 5 — Block-Extraktion:
+#   Nur Blöcke mit ≥ 3 Zeilen (Backslash-Continuation) werden angeboten.
+#   Einzelzeilen (egal wie lang) bleiben immer in der History.
+#   [m] öffnet den vollständigen Block in less (von /dev/tty).
 #
 # AppleScript fc -W (Schritt 1.5):
 #   Schickt fc -W an alle idle Terminal.app Tabs (busy=false).
@@ -32,9 +36,9 @@
 #   einmalig 'fc -R ~/.zsh_history' eingeben oder neues Tab öffnen.
 # =============================================================================
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # SCHRITT 0 — Auto-Pull (Script immer aktuell halten)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 _SCRIPT_DIR="${${(%):-%x}:A:h}"
 if [[ -d "${_SCRIPT_DIR}/../.git" ]]; then
   _PULL_OUT=$(git -C "${_SCRIPT_DIR}/.." pull --ff-only 2>&1)
@@ -69,9 +73,8 @@ MERGED_DUMP="/tmp/zsh_hist_merged_${TIMESTAMP}.txt"
 NORM_DUMP="/tmp/zsh_hist_norm_${TIMESTAMP}.txt"
 BLOCKS_FILE="/tmp/zsh_hist_blocks_${TIMESTAMP}.txt"
 CLEAN_FILE="/tmp/zsh_hist_clean_${TIMESTAMP}.txt"
-LONG_FILE="/tmp/zsh_hist_long_${TIMESTAMP}.txt"
 SECRET_FILE="/tmp/zsh_hist_secrets_${TIMESTAMP}.txt"
-LONG_THRESH=50
+MIN_BLOCK_LINES=3
 DRY_RUN=0
 SKIP_EXTRACT=0
 
@@ -90,10 +93,10 @@ printf "║         ZSH History Cleanup — %-22s║\n" "$(date '+%Y-%m-%d %H:%M
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Hilfsfunktion: Alle User-Eingaben immer von /dev/tty lesen.
-# Verhindert Hänger wenn andere fds (3, 4, stdin-Pipes) offen sind.
-# ─────────────────────────────────────────────────────────────────────────────
+# Verhindert Hänger wenn andere fds offen sind.
+# -----------------------------------------------------------------------------
 ask() {
   local _var="$1" _prompt="$2"
   local _reply
@@ -101,9 +104,9 @@ ask() {
   typeset -g "${_var}"="${_reply}"
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # SCHRITT 1 — Offene Terminal-Sessions analysieren
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 echo "📋 SCHRITT 1 — Terminal-Sessions (informativ)"
 
 SESSION_FILES=(~/.zsh_sessions/*.historynew(N))
@@ -139,9 +142,9 @@ else
   ask _ "   Enter zum Fortfahren: "
 fi
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # SCHRITT 1.5 — fc -W in alle anderen Terminal.app Tabs schicken (optional)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 echo ""
 echo "📲 SCHRITT 1.5 — fc -W in andere Terminal.app Tabs schicken"
 echo ""
@@ -231,9 +234,9 @@ fi
 
 echo ""
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # SCHRITT 2 — Backup + Merge aller History-Quellen
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 echo ""
 echo "💾 SCHRITT 2 — Backup & Merge"
 mkdir -p "${BACKUP_DIR}"
@@ -275,18 +278,18 @@ if [[ "${MERGED_COUNT}" -eq 0 ]]; then
   exit 1
 fi
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # SCHRITT 2a — UTF-8 Sanitize
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 echo "   → UTF-8 Sanitize (iconv)..."
 iconv -f UTF-8 -t UTF-8 -c "${MERGED_DUMP}" > "${MERGED_DUMP}.utf8" && \
   mv "${MERGED_DUMP}.utf8" "${MERGED_DUMP}" || \
   echo "   ⚠️  iconv nicht verfügbar — weiter ohne Sanitize"
 echo "   ✓ UTF-8 bereinigt"
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # SCHRITT 2b — Normalisierung
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 echo "   → Normalisierung..."
 
 LC_ALL=C sed 's/\\n$//' "${MERGED_DUMP}" \
@@ -322,30 +325,14 @@ for line in sys.stdin:
 NORM_COUNT=$(wc -l < "${NORM_DUMP}" | tr -d ' ')
 echo "   ✓ Normalisiert: ${NORM_COUNT} Zeilen"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SCHRITT 2c — Backslash-Continuation Blöcke extrahieren
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# SCHRITT 2c — Blöcke und Einzelzeilen trennen
+# Blöcke (Backslash-Continuation, NUL-separiert) → BLOCKS_FILE.raw
+# Einzelzeilen                                    → BLOCKS_FILE (plain)
+# -----------------------------------------------------------------------------
 echo "   → Blöcke erkennen..."
-mkdir -p "${SCRIPTS_DIR}"
 
-if [[ ! -d "${SCRIPTS_DIR}/.git" ]]; then
-  git -C "${SCRIPTS_DIR}" init -b main --quiet 2>/dev/null || \
-  git -C "${SCRIPTS_DIR}" init --quiet
-fi
-
-_derive_script_name() {
-  local block="$1"
-  local date_prefix=$(date +%Y%m%d)
-  local name=""
-  name=$(echo "${block}" | grep '^#' | head -1 | sed 's/^#[[:space:]]*//' | tr ' ' '-' | tr -cd 'a-z0-9-' | cut -c1-30)
-  if [[ -z "${name}" ]]; then
-    name=$(echo "${block}" | grep -v '^#' | head -1 | awk '{print $1}' | tr -cd 'a-z0-9_-' | cut -c1-20)
-  fi
-  [[ -z "${name}" ]] && name="script"
-  echo "${date_prefix}_${name}"
-}
-
-# Blöcke → .raw (NUL-separiert), plain Zeilen → BLOCKS_FILE
+# Blöcke → .raw (NUL-separiert)
 LC_ALL=C awk '
 /\\$/ {
   sub(/\\$/, "")
@@ -358,11 +345,11 @@ LC_ALL=C awk '
 }
 {
   if (block != "") { printf "%s\x00", block; block = "" }
-  print $0
 }
 END { if (block != "") printf "%s\x00", block }
 ' "${NORM_DUMP}" > "${BLOCKS_FILE}.raw"
 
+# Einzelzeilen (keine Blöcke) → BLOCKS_FILE
 LC_ALL=C awk '
 /\\$/ {
   sub(/\\$/, "")
@@ -379,97 +366,33 @@ LC_ALL=C awk '
 }
 ' "${NORM_DUMP}" > "${BLOCKS_FILE}"
 
-BLOCK_COUNT=$(python3 -c "
+BLOCK_COUNT_RAW=$(python3 -c "
 import sys
 data = open('${BLOCKS_FILE}.raw', 'rb').read()
-print(data.count(b'\\x00'))
+print(data.count(b'\x00'))
 " 2>/dev/null || echo 0)
 
+# Nur Blöcke mit >= MIN_BLOCK_LINES Zeilen zählen
+BLOCK_COUNT=$(python3 -c "
+import os
+min_lines = int(os.environ.get('MIN_BLOCK_LINES', '3'))
+data = open('${BLOCKS_FILE}.raw', 'rb').read()
+blocks = [b for b in data.split(b'\x00') if b]
+print(sum(1 for b in blocks if b.count(b'\n') + 1 >= min_lines))
+" 2>/dev/null || echo 0)
+export MIN_BLOCK_LINES
+
 PLAIN_COUNT=$(wc -l < "${BLOCKS_FILE}" | tr -d ' ')
-echo "   ✓ Blöcke erkannt: ${BLOCK_COUNT} (→ ~/scripts/)"
-echo "   ✓ Einzelzeilen:   ${PLAIN_COUNT}"
+echo "   ✓ Blöcke gesamt: ${BLOCK_COUNT_RAW}  davon >=${MIN_BLOCK_LINES} Zeilen: ${BLOCK_COUNT}"
+echo "   ✓ Einzelzeilen:  ${PLAIN_COUNT}"
 
-if [[ "${BLOCK_COUNT}" -gt 0 && "${SKIP_EXTRACT}" == 0 ]]; then
-  echo ""
-  echo "📦 Blöcke werden automatisch nach ${SCRIPTS_DIR}/ extrahiert..."
-  echo ""
-
-  BLOCK_IDX=0
-  exec 3< "${BLOCKS_FILE}.raw"
-  while IFS= read -r -d $'\0' BLOCK <&3; do
-    BLOCK_IDX=$((BLOCK_IDX + 1))
-    SUGGESTED=$(_derive_script_name "${BLOCK}")
-    PREVIEW=$(echo "${BLOCK}" | head -3)
-
-    echo "   [${BLOCK_IDX}/${BLOCK_COUNT}] Vorgeschlagener Name: ${SUGGESTED}"
-    echo "   Preview:"
-    print -r -- "${PREVIEW}" | sed 's/^/     /'
-    echo ""
-
-    if [[ "${SUGGESTED}" == *"_script" && $(echo "${BLOCK}" | grep -c '^#') -eq 0 ]]; then
-      ask BNAME "   Name (Enter = ${SUGGESTED}, d = löschen, s = überspringen): "
-    else
-      ask BNAME "   Enter = ${SUGGESTED}, anderer Name, d = löschen, s = überspringen: "
-    fi
-
-    case "${BNAME}" in
-      d|D)
-        echo "   → Gelöscht (nicht extrahiert)"
-        continue
-        ;;
-      s|S)
-        echo "   → Übersprungen (bleibt in History)"
-        echo "${BLOCK}" >> "${BLOCKS_FILE}"
-        continue
-        ;;
-      "")
-        FINAL_NAME="${SUGGESTED}"
-        ;;
-      *)
-        FINAL_NAME="${BNAME}"
-        ;;
-    esac
-
-    [[ "${FINAL_NAME}" != *.sh ]] && FINAL_NAME="${FINAL_NAME}.sh"
-    [[ ! "${FINAL_NAME}" =~ ^[0-9]{8}_ ]] && FINAL_NAME="$(date +%Y%m%d)_${FINAL_NAME}"
-
-    SPATH="${SCRIPTS_DIR}/${FINAL_NAME}"
-
-    if [[ "${DRY_RUN}" == 1 ]]; then
-      echo "   [DRY-RUN] Würde speichern: ${SPATH}"
-    else
-      printf '#!/usr/bin/env zsh\n# Extracted: %s\n# From: zsh history cleanup\n# ---\n\n%s\n' \
-        "$(date '+%Y-%m-%d %H:%M')" "${BLOCK}" > "${SPATH}"
-      chmod +x "${SPATH}"
-      git -C "${SCRIPTS_DIR}" add "${FINAL_NAME}" 2>/dev/null || true
-      git -C "${SCRIPTS_DIR}" commit -m "extract: ${FINAL_NAME}" --quiet 2>/dev/null || true
-      echo "   ✓ Gespeichert + committed: ${SPATH}"
-    fi
-    echo ""
-  done
-  exec 3<&-
-fi
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SCHRITT 3 — Lange Einträge finden
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# SCHRITT 3 — Secret-Erkennung
+# -----------------------------------------------------------------------------
 echo ""
-echo "📏 SCHRITT 3 — Lange Einträge analysieren (>${LONG_THRESH} Zeichen)"
+echo "🔐 SCHRITT 3 — Secret-Erkennung"
 
-awk -v thresh="${LONG_THRESH}" '
-  length($0) > thresh { print }
-' "${BLOCKS_FILE}" | sort -u > "${LONG_FILE}"
-
-LONG_COUNT=$(wc -l < "${LONG_FILE}" | tr -d ' ')
-echo "   Gefunden: ${LONG_COUNT} lange Einträge (>${LONG_THRESH} Zeichen)"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SCHRITT 4 — Secret-Erkennung
-# ─────────────────────────────────────────────────────────────────────────────
-echo ""
-echo "🔐 SCHRITT 4 — Secret-Erkennung"
-
-export BLOCKS_FILE
+export BLOCKS_FILE NORM_DUMP
 python3 - << 'PYEOF' > "${SECRET_FILE}" 2>/dev/null
 import sys, math, re, os
 
@@ -512,9 +435,9 @@ PYEOF
 SECRET_COUNT=$(wc -l < "${SECRET_FILE}" | tr -d ' ')
 if [[ "${SECRET_COUNT}" -gt 0 ]]; then
   echo "   ⚠️  ${SECRET_COUNT} potenzielle Secrets gefunden:"
-  echo "   ────────────────────────────────────────────────────"
+  echo "   ----------------------------------------------------"
   head -20 "${SECRET_FILE}"
-  echo "   ────────────────────────────────────────────────────"
+  echo "   ----------------------------------------------------"
   echo ""
   ask SCONT "   Diese Einträge aus der History entfernen? [J/n] "
   REMOVE_SECRETS="J"
@@ -524,115 +447,134 @@ else
   REMOVE_SECRETS="N"
 fi
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SCHRITT 5 — Interaktive Extraktion langer Einträge als Scripts
-# Preview: erste 3 Zeilen (je max. 100 Zeichen), [m] für weitere 10 Zeilen.
-# Default-Aktion: [s] (als Script speichern).
-# fd 4 für LONG_FILE → ask() liest explizit von /dev/tty, unabhängig von fd 4.
-# ─────────────────────────────────────────────────────────────────────────────
-_show_entry_preview() {
-  local entry="$1" lines="${2:-3}" max_chars=100
-  print -r -- "${entry}" | head -"${lines}" | while IFS= read -r ln; do
-    print -r -- "   ${ln[1,${max_chars}]}"
-  done
-  local total_lines
-  total_lines=$(print -r -- "${entry}" | wc -l | tr -d ' ')
-  if [[ ${total_lines} -gt ${lines} ]]; then
-    echo "   ... (${total_lines} Zeilen gesamt, ${#entry} Zeichen)"
-  else
-    echo "   (${#entry} Zeichen)"
+# -----------------------------------------------------------------------------
+# SCHRITT 4 — Script-Name ableiten
+# -----------------------------------------------------------------------------
+_derive_script_name() {
+  local block="$1"
+  local date_prefix=$(date +%Y%m%d)
+  local name=""
+  name=$(echo "${block}" | grep '^#' | head -1 | sed 's/^#[[:space:]]*//' | tr ' ' '-' | tr -cd 'a-z0-9-' | cut -c1-30)
+  if [[ -z "${name}" ]]; then
+    name=$(echo "${block}" | grep -v '^#' | head -1 | awk '{print $1}' | tr -cd 'a-z0-9_-' | cut -c1-20)
   fi
+  [[ -z "${name}" ]] && name="script"
+  echo "${date_prefix}_${name}"
 }
 
-if [[ "${SKIP_EXTRACT}" == 0 && "${LONG_COUNT}" -gt 0 ]]; then
-  echo ""
-  echo "📝 SCHRITT 5 — Lange Einträge als Scripts speichern"
-  echo "   Schwelle: >${LONG_THRESH} Zeichen | ${LONG_COUNT} Einträge"
-  mkdir -p "${SCRIPTS_DIR}"
+mkdir -p "${SCRIPTS_DIR}"
+if [[ ! -d "${SCRIPTS_DIR}/.git" ]]; then
+  git -C "${SCRIPTS_DIR}" init -b main --quiet 2>/dev/null || \
+  git -C "${SCRIPTS_DIR}" init --quiet
+fi
 
-  INDEX=0
-  exec 4< "${LONG_FILE}"
-  while IFS= read -r ENTRY <&4; do
-    INDEX=$((INDEX + 1))
-    echo ""
-    echo "   ┌─ [${INDEX}/${LONG_COUNT}] $({'─' * 46})"
-    _show_entry_preview "${ENTRY}" 3
-    echo "   └──────────────────────────────────────────────────────"
+# -----------------------------------------------------------------------------
+# SCHRITT 5 — Interaktive Extraktion: Blöcke mit >= MIN_BLOCK_LINES Zeilen
+# [s] Als Script speichern   [i] In History behalten   [d] Löschen
+# [m] Vollständig in less anzeigen                      [q] Abbrechen
+# Default: [s]
+# -----------------------------------------------------------------------------
+if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
+  echo ""
+  echo "📦 SCHRITT 5 — Mehrzeilige Blöcke extrahieren"
+  echo "   Blöcke mit >= ${MIN_BLOCK_LINES} Zeilen: ${BLOCK_COUNT}"
+  echo ""
+
+  BLOCK_IDX=0
+  EXTRACTED_COUNT=0
+  DELETED_COUNT=0
+
+  exec 3< "${BLOCKS_FILE}.raw"
+  while IFS= read -r -d $'\0' BLOCK <&3; do
+    # Nur Blöcke >= MIN_BLOCK_LINES verarbeiten
+    BLOCK_LINES=$(print -r -- "${BLOCK}" | wc -l | tr -d ' ')
+    [[ "${BLOCK_LINES}" -lt "${MIN_BLOCK_LINES}" ]] && continue
+
+    BLOCK_IDX=$((BLOCK_IDX + 1))
+    SUGGESTED=$(_derive_script_name "${BLOCK}")
+
+    echo "   +----------------------------------------------------------+"
+    printf "   |  [%d/%d]  %d Zeilen\n" "${BLOCK_IDX}" "${BLOCK_COUNT}" "${BLOCK_LINES}"
+    echo "   +----------------------------------------------------------+"
+    # Erste 3 Zeilen als Preview (max 90 Zeichen pro Zeile)
+    print -r -- "${BLOCK}" | head -3 | while IFS= read -r ln; do
+      printf "   %s\n" "${ln[1,90]}"
+    done
+    if [[ "${BLOCK_LINES}" -gt 3 ]]; then
+      echo "   ... (${BLOCK_LINES} Zeilen gesamt)"
+    fi
     echo ""
     echo "   [s] Als Script   [i] In History behalten   [d] Löschen"
-    echo "   [m] Mehr anzeigen (+10 Zeilen)             [q] Abbrechen"
+    echo "   [m] In less anzeigen                        [q] Abbrechen"
     ask ACTION "   Aktion [s]: "
     ACTION="${ACTION:-s}"
 
-    # [m] — mehr Preview, dann erneut fragen
-    while [[ "${ACTION}" == "m" || "${ACTION}" == "M" ]]; do
+    # [m] → less öffnen, dann nochmal fragen
+    if [[ "${ACTION}" == "m" || "${ACTION}" == "M" ]]; then
+      print -r -- "${BLOCK}" | less < /dev/tty > /dev/tty 2>/dev/null || \
+        print -r -- "${BLOCK}" | more < /dev/tty > /dev/tty 2>/dev/null || true
       echo ""
-      _show_entry_preview "${ENTRY}" 13
-      echo ""
-      echo "   [s] Als Script   [i] In History behalten   [d] Löschen"
-      echo "   [m] Noch mehr (+10 Zeilen)                 [q] Abbrechen"
+      echo "   [s] Als Script   [i] In History behalten   [d] Löschen   [q] Abbrechen"
       ask ACTION "   Aktion [s]: "
       ACTION="${ACTION:-s}"
-      # Für [m] erneut 10 weitere: einfach Zähler erhöhen und neu rendern
-      if [[ "${ACTION}" == "m" || "${ACTION}" == "M" ]]; then
-        # Bereits alles gezeigt — zeige vollständig
-        echo ""
-        echo "   ── Vollständiger Eintrag (${#ENTRY} Zeichen) ──────────────"
-        print -r -- "${ENTRY}" | sed 's/^/   /'
-        echo "   ──────────────────────────────────────────────────────"
-        echo ""
-        echo "   [s] Als Script   [i] In History behalten   [d] Löschen   [q] Abbrechen"
-        ask ACTION "   Aktion [s]: "
-        ACTION="${ACTION:-s}"
-        break
-      fi
-    done
+    fi
 
     case "${ACTION}" in
       s|S)
-        DATE_PREFIX=$(date +%Y%m%d)
-        SUGGESTION=$(echo "${ENTRY}" | awk '{print $1}' | tr -cd 'a-z0-9_-' | cut -c1-20)
-        SUGGESTION="${DATE_PREFIX}_${SUGGESTION}_script"
-        ask SNAME "   Name [${SUGGESTION}]: "
-        SNAME="${SNAME:-${SUGGESTION}}"
+        ask SNAME "   Name [${SUGGESTED}]: "
+        SNAME="${SNAME:-${SUGGESTED}}"
         [[ "${SNAME}" != *.sh ]] && SNAME="${SNAME}.sh"
-        [[ ! "${SNAME}" =~ ^[0-9]{8}_ ]] && SNAME="${DATE_PREFIX}_${SNAME}"
+        [[ ! "${SNAME}" =~ ^[0-9]{8}_ ]] && SNAME="$(date +%Y%m%d)_${SNAME}"
         SPATH="${SCRIPTS_DIR}/${SNAME}"
-        printf '#!/usr/bin/env zsh\n# Extracted: %s\n# From: history cleanup\n# ---\n\n%s\n' \
-          "$(date '+%Y-%m-%d %H:%M')" "${ENTRY}" > "${SPATH}"
-        chmod +x "${SPATH}"
-        git -C "${SCRIPTS_DIR}" add "${SNAME}" 2>/dev/null || true
-        git -C "${SCRIPTS_DIR}" commit -m "extract: ${SNAME}" --quiet 2>/dev/null || true
-        echo "   ✓ Gespeichert: ${SPATH}"
-        echo "${ENTRY}" >> "${LONG_FILE}.delete"
+        if [[ "${DRY_RUN}" == 1 ]]; then
+          echo "   [DRY-RUN] Würde speichern: ${SPATH}"
+        else
+          printf '#!/usr/bin/env zsh\n# Extracted: %s\n# From: zsh history cleanup\n# ---\n\n%s\n' \
+            "$(date '+%Y-%m-%d %H:%M')" "${BLOCK}" > "${SPATH}"
+          chmod +x "${SPATH}"
+          git -C "${SCRIPTS_DIR}" add "${SNAME}" 2>/dev/null || true
+          git -C "${SCRIPTS_DIR}" commit -m "extract: ${SNAME}" --quiet 2>/dev/null || true
+          echo "   ✓ Gespeichert + committed: ${SPATH}"
+          EXTRACTED_COUNT=$((EXTRACTED_COUNT + 1))
+        fi
         ;;
       d|D)
-        echo "   ✓ Wird entfernt"
-        echo "${ENTRY}" >> "${LONG_FILE}.delete"
+        echo "   → Gelöscht (nicht in History)"
+        DELETED_COUNT=$((DELETED_COUNT + 1))
         ;;
       q|Q)
         echo "   → Abgebrochen"
         break
         ;;
       *)
-        echo "   → Behalten (in History)"
+        echo "   → Behalten (bleibt in History)"
+        # Block wieder in Einzelzeilen-Datei aufnehmen damit er nicht verloren geht
+        print -r -- "${BLOCK}" >> "${BLOCKS_FILE}"
         ;;
     esac
+    echo ""
   done
-  exec 4<&-
+  exec 3<&-
+
+  echo "   ✓ Extrahiert: ${EXTRACTED_COUNT}  |  Gelöscht: ${DELETED_COUNT}"
 else
-  [[ "${SKIP_EXTRACT}" == 1 ]] && echo "   → Übersprungen (--skip-extract)"
+  if [[ "${SKIP_EXTRACT}" == 1 ]]; then
+    echo ""
+    echo "   → Schritt 5 übersprungen (--skip-extract)"
+  elif [[ "${BLOCK_COUNT}" -eq 0 ]]; then
+    echo ""
+    echo "   ℹ️  Keine Blöcke mit >= ${MIN_BLOCK_LINES} Zeilen gefunden — Schritt 5 entfällt"
+  fi
 fi
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SCHRITT 6 — Bereinigung
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# SCHRITT 6 — Bereinigung + Dedup
+# -----------------------------------------------------------------------------
 echo ""
 echo "🧹 SCHRITT 6 — History bereinigen"
 
 ENTRIES_TO_DELETE="/tmp/zsh_hist_delete_${TIMESTAMP}.txt"
 touch "${ENTRIES_TO_DELETE}"
-[[ -f "${LONG_FILE}.delete" ]] && cat "${LONG_FILE}.delete" >> "${ENTRIES_TO_DELETE}"
 
 if [[ "${REMOVE_SECRETS}" == "J" ]]; then
   grep '^\[.*\] ' "${SECRET_FILE}" | sed 's/^\[.*\] //' >> "${ENTRIES_TO_DELETE}"
@@ -653,9 +595,9 @@ fi
 CLEAN_COUNT=$(wc -l < "${CLEAN_FILE}" | tr -d ' ')
 echo "   ✓ Bereinigt: ${CLEAN_COUNT} Einträge (war: ${MERGED_COUNT} Rohzeilen)"
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # SCHRITT 7 — Schreiben
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 echo ""
 echo "💿 SCHRITT 7 — History schreiben"
 
@@ -682,17 +624,16 @@ else
 fi
 
 rm -f "${MERGED_DUMP}" "${NORM_DUMP}" "${BLOCKS_FILE}" "${BLOCKS_FILE}.raw" \
-      "${CLEAN_FILE}" "${LONG_FILE}" "${LONG_FILE}.delete" \
-      "${SECRET_FILE}" "${ENTRIES_TO_DELETE}" 2>/dev/null || true
+      "${CLEAN_FILE}" "${SECRET_FILE}" "${ENTRIES_TO_DELETE}" 2>/dev/null || true
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
 echo "║  ✅ Fertig!  Backup: ~/.zsh_history_backups/         ║"
 if [[ "${DRY_RUN}" != 1 ]]; then
-  echo "║                                                    ║"
-  echo "║  ℹ️  History in diesem Tab noch nicht aktuell.    ║"
-  echo "║  → Einmalig eingeben: fc -R ~/.zsh_history         ║"
-  echo "║  → Oder einfach neues Terminal-Tab öffnen.         ║"
+  echo "║                                                      ║"
+  echo "║  ℹ️  History in diesem Tab noch nicht aktuell.       ║"
+  echo "║  → Einmalig eingeben: fc -R ~/.zsh_history           ║"
+  echo "║  → Oder einfach neues Terminal-Tab öffnen.           ║"
 fi
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
