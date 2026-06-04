@@ -91,6 +91,17 @@ echo "╚═══════════════════════�
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Hilfsfunktion: Alle User-Eingaben immer von /dev/tty lesen.
+# Verhindert Hänger wenn andere fds (3, 4, stdin-Pipes) offen sind.
+# ─────────────────────────────────────────────────────────────────────────────
+ask() {
+  local _var="$1" _prompt="$2"
+  local _reply
+  IFS= read -r "_reply?${_prompt}" < /dev/tty
+  typeset -g "${_var}"="${_reply}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 1 — Offene Terminal-Sessions analysieren
 # ─────────────────────────────────────────────────────────────────────────────
 echo "📋 SCHRITT 1 — Terminal-Sessions (informativ)"
@@ -125,7 +136,7 @@ else
   fi
 
   echo ""
-  read "?   Enter zum Fortfahren: "
+  ask _ "   Enter zum Fortfahren: "
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -151,7 +162,7 @@ echo ""
 echo "   Voraussetzung: Terminal.app hat Accessibility-Rechte"
 echo "   (Einstellungen > Datenschutz > Bedienungshilfen)"
 echo ""
-read "APPLESCRIPT_RUN?   fc -W an alle anderen Tabs schicken? [J/n] "
+ask APPLESCRIPT_RUN "   fc -W an alle anderen Tabs schicken? [J/n] "
 
 if [[ "${APPLESCRIPT_RUN}" != "n" && "${APPLESCRIPT_RUN}" != "N" ]]; then
   echo ""
@@ -391,7 +402,6 @@ if [[ "${BLOCK_COUNT}" -gt 0 && "${SKIP_EXTRACT}" == 0 ]]; then
   echo ""
 
   BLOCK_IDX=0
-  # fd 3 → stdin bleibt frei für read (interaktive Eingabe im Loop)
   exec 3< "${BLOCKS_FILE}.raw"
   while IFS= read -r -d $'\0' BLOCK <&3; do
     BLOCK_IDX=$((BLOCK_IDX + 1))
@@ -404,9 +414,9 @@ if [[ "${BLOCK_COUNT}" -gt 0 && "${SKIP_EXTRACT}" == 0 ]]; then
     echo ""
 
     if [[ "${SUGGESTED}" == *"_script" && $(echo "${BLOCK}" | grep -c '^#') -eq 0 ]]; then
-      read "BNAME?   Name (Enter = ${SUGGESTED}, d = löschen, s = überspringen): "
+      ask BNAME "   Name (Enter = ${SUGGESTED}, d = löschen, s = überspringen): "
     else
-      read "BNAME?   Enter = ${SUGGESTED}, anderer Name, d = löschen, s = überspringen: "
+      ask BNAME "   Enter = ${SUGGESTED}, anderer Name, d = löschen, s = überspringen: "
     fi
 
     case "${BNAME}" in
@@ -513,7 +523,7 @@ if [[ "${SECRET_COUNT}" -gt 0 ]]; then
   head -20 "${SECRET_FILE}"
   echo "   ────────────────────────────────────────────────────"
   echo ""
-  read "SCONT?   Diese Einträge aus der History entfernen? [J/n] "
+  ask SCONT "   Diese Einträge aus der History entfernen? [J/n] "
   REMOVE_SECRETS="J"
   [[ "${SCONT}" == "n" || "${SCONT}" == "N" ]] && REMOVE_SECRETS="N"
 else
@@ -523,7 +533,7 @@ fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 5 — Interaktive Extraktion langer Einträge als Scripts
-# fd 4 für LONG_FILE → stdin bleibt /dev/tty frei für interaktive read-Aufrufe.
+# fd 4 für LONG_FILE → ask() liest explizit von /dev/tty, unabhängig von fd 4.
 # ─────────────────────────────────────────────────────────────────────────────
 if [[ "${SKIP_EXTRACT}" == 0 && "${LONG_COUNT}" -gt 0 ]]; then
   echo ""
@@ -540,15 +550,14 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${LONG_COUNT}" -gt 0 ]]; then
     print -r -- "   ${PREVIEW}..."
     echo ""
     echo "   [s] Als Script   [i] In History behalten   [d] Löschen   [q] Abbrechen"
-    read "ACTION?   Aktion: "
+    ask ACTION "   Aktion: "
 
     case "${ACTION}" in
       s|S)
         DATE_PREFIX=$(date +%Y%m%d)
         SUGGESTION=$(echo "${ENTRY}" | awk '{print $1}' | tr -cd 'a-z0-9_-' | cut -c1-20)
         SUGGESTION="${DATE_PREFIX}_${SUGGESTION}_script"
-        echo -n "   Name [${SUGGESTION}]: "
-        read SNAME
+        ask SNAME "   Name [${SUGGESTION}]: "
         SNAME="${SNAME:-${SUGGESTION}}"
         [[ "${SNAME}" != *.sh ]] && SNAME="${SNAME}.sh"
         [[ ! "${SNAME}" =~ ^[0-9]{8}_ ]] && SNAME="${DATE_PREFIX}_${SNAME}"
@@ -623,7 +632,7 @@ if [[ "${DRY_RUN}" == 1 ]]; then
   echo ""
   echo "   [DRY-RUN] Keine Änderungen vorgenommen."
 else
-  read "CONFIRM?   Jetzt ${CLEAN_COUNT} Einträge in ${HISTFILE} schreiben? [J/n] "
+  ask CONFIRM "   Jetzt ${CLEAN_COUNT} Einträge in ${HISTFILE} schreiben? [J/n] "
   if [[ "${CONFIRM}" == "n" || "${CONFIRM}" == "N" ]]; then
     echo "   → Abgebrochen. Backup bleibt unter ${BACKUP_DIR}/"
     exit 0
