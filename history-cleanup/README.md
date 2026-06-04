@@ -1,6 +1,25 @@
 # ZSH History Cleanup — Analyse & Plan
 
-Dieser Ordner dokumentiert alle bisherigen Versuche, die zsh-History auf macOS zu bereinigen, erklärt was schiefgelaufen ist, und enthält einen sauberen Plan für die Zukunft.
+Dieser Ordner dokumentiert alle bisherigen Versuche, die zsh-History auf macOS zu bereinigen,
+erklärt was schiefgelaufen ist, und enthält einen sauberen Plan für die Zukunft.
+
+---
+
+## Schnellstart
+
+```bash
+# Repo pullen
+cd ~/git/dotfiles-macos && git pull
+
+# Setup (einmalig)
+zsh ~/git/dotfiles-macos/scripts-tracker/setup.sh
+
+# History cleanup (interaktiv)
+zsh ~/git/dotfiles-macos/history-cleanup/clean-history.sh
+
+# Nur anschauen ohne Änderungen
+zsh ~/git/dotfiles-macos/history-cleanup/clean-history.sh --dry-run
+```
 
 ---
 
@@ -10,82 +29,73 @@ Dieser Ordner dokumentiert alle bisherigen Versuche, die zsh-History auf macOS z
 ```bash
 fc -l -10000 > ~/.zsh_history.live
 ```
-**Problem:** `fc -l` gibt die Zeilennummern mit aus (z.B. `  987  ssh klanz@...`).  
-Diese Nummern wurden direkt in die History-Datei gespeichert — alle Einträge hatten dann eine Nummer am Anfang.
+**Problem:** `fc -l` gibt Zeilennummern mit aus (z.B. `  987  ssh klanz@...`).  
+Diese Nummern wurden direkt in die History-Datei gespeichert.
 
-### Versuch 2 — `fc -ln` mit zu großem `-n` Wert
+### Versuch 2 — `fc -ln` + awk
 ```bash
 fc -ln -10000 > ~/.zsh_history.live
 LC_ALL=C awk 'NF>0 && length($0)<=150' ~/.zsh_history.live > ~/.zsh_history.clean
 mv ~/.zsh_history.clean ~/.zsh_history
-rm -rf ~/.zsh_sessions/* 2>/dev/null
-fc -R ~/.zsh_history
+rm -rf ~/.zsh_sessions/* && fc -R
 ```
-**Problem:** Teils funktioniert, aber:
-- Einige History-Blöcke wurden durch macOS Session-Dateien (`~/.zsh_sessions/*.historynew`) dupliziert
-- Die History wird beim Schließen des Terminals erneut aus der Session-Datei eingelesen → Duplikate nach Neustart
-- Einzelne Zeilen hatten nach dem Reload wieder Nummern am Anfang (von alten Session-Dateien)
-- `awk length()` zählt Bytes, nicht Zeichen → Probleme bei UTF-8/Unicode (Umlaute, Emojis)
-
-### Was wir im `cat ~/.zsh_history` sehen
-- Zeilen wie `   29  brew install wireguard-tools` → Nummern vom `fc -l` Dump
-- Zeilen mit eingebetteten `\n` → mehrere Befehle als eine Zeile gespeichert (macOS zsh speichert Multiline-Commands so)
-- Encoding-Artefakte: `GröÃ?e` statt `Größe` → UTF-8 Corruption beim `awk` ohne `LC_ALL=C`
-- `[200~` am Anfang einer Zeile → Bracket Paste Mode artefact (Terminal hat Paste-Code nicht gefiltert)
-- Wiederholte Blöcke → Mehrfach durch verschiedene Session-Dateien eingelesen
+**Problem:** macOS Session-Dateien (`~/.zsh_sessions/*.historynew`) haben Duplikate nach Neustart
+erzeugt, weil sie beim Schließen des Terminals erneut in `~/.zsh_history` eingemischt wurden.
 
 ### Root Cause: macOS zsh Session-Management
-macOS verwendet `~/.zsh_sessions/` um pro Terminal-Session eine eigene History-Datei zu führen.
-Beim Öffnen eines neuen Terminals wird die Session-Datei **zusätzlich** zu `~/.zsh_history` geladen.
-Beim Schließen wird die Session-Datei mit `~/.zsh_history` zusammengeführt.
-→ Solange alte Session-Dateien existieren, werden sie beim Reload/Neustart neu eingelesen.
+macOS führt pro Terminal-Fenster eine eigene `~/.zsh_sessions/*.historynew` Datei.  
+Beim Schließen wird diese in `~/.zsh_history` gemergt.  
+Solange alte Session-Dateien existieren, werden sie beim Reload/Neustart neu eingelesen → Duplikate.
+
+**Lösung:** Alle Session-Dateien nach dem Cleanup löschen.
 
 ---
 
-## Sauberer Plan: History Tracker für zsh (macOS)
+## macOS-Eigenheiten
 
-### Ziel
-- Eine **saubere, deduplizierte** History ohne Passwörter, ohne `\n`-Artefakte, ohne Nummern
-- History in einem **lokalen git** versioniert (Forgejo-ready)
-- Bewusste Commits mit Kommentaren möglich
-- Passwörter/Secrets werden herausgefiltert (ähnlich wie `git-secrets` / `truffleHog`)
-- Später: Branching-Strategie für verschiedene Kontexte (ETSI, local-ai, privat)
+| Problem | Ursache | Lösung im Script |
+|---|---|---|
+| Duplikate nach Neustart | `~/.zsh_sessions/*.historynew` | Alle Session-Files nach Cleanup löschen |
+| Andere offene Terminals verlieren History | Session-Files noch nicht gespeichert | Hinweis + `fc -W` in anderen Fenstern |
+| History-Nummern in Datei | `fc -l` statt `fc -ln` | `fc -ln` verwenden |
+| `[200~` Artefakte | Bracket Paste Mode | awk-Filter |
+| UTF-8 Corruption | awk ohne `LC_ALL=C` | `LC_ALL=C awk` |
+| Cursor-Integration in History | Cursor fügt `shellIntegration-rc.zsh` Source-Befehl ein | awk-Filter |
 
-### Schritt 1 — Einmalige Bereinigung (clean-history.sh)
-Siehe `clean-history.sh` in diesem Ordner.
+---
 
-### Schritt 2 — Laufender Tracker (history-tracker.sh)
+## Script-Übersicht
+
 ```
 history-cleanup/
 ├── README.md              ← dieser Plan
-├── clean-history.sh       ← einmalige Bereinigung
-├── history-tracker.sh     ← regelmäßiger Export + git commit (TODO)
-├── filter-secrets.awk     ← Passwort/Secret-Filter (TODO)
-└── .gitignore             ← Verhindert echte History-Dateien im Repo
+├── clean-history.sh       ← Haupt-Script (interaktiv, macOS-aware)
+├── find-safe.sh           ← find mit komprimierter Fehlerausgabe
+└── .gitignore
+
+scripts-tracker/
+├── README.md              ← Scripts Tracker Dokumentation
+├── setup.sh               ← Einmaliges Setup (~/scripts/ + ~/bin/)
+└── paste-to-script.zsh    ← save-script Funktion für .zshrc
 ```
 
-### Schritt 3 — Git-Struktur
-```
-~/history-git/
-├── .git/
-├── history.log            ← exportierte, bereinigte History
-└── sessions/
-    ├── etsi.log           ← nach Kontext gefiltert
-    ├── local-ai.log
-    └── private.log
-```
+---
 
-### Schritt 4 — Secret-Filter (Patterns)
-Diese Patterns sollten vor dem Commit herausgefiltert werden:
-- `--password`, `-p <wert>`, `-P <wert>`
-- `export SECRET=`, `export TOKEN=`, `export KEY=`
-- `curl ... -u user:pass`
-- `Authorization: Bearer ...`
-- Private Keys / `-----BEGIN`
-- IP-Adressen aus privatem Netz (optional: 192.168.x.x, 10.x.x.x)
+## clean-history.sh — Was es macht
 
-### Nächste Schritte
-- [ ] `filter-secrets.awk` schreiben
-- [ ] `history-tracker.sh` schreiben (cronjob oder shell-hook `precmd`)
-- [ ] Forgejo-Repo anlegen + pushen
-- [ ] `.zshrc` Hook: `fc -W` vor jedem Commit um aktuelle Session zu sichern
+1. **Zeigt offene Terminal-Sessions** — Hinweis wenn andere Fenster noch unsaved History haben
+2. **Merged alle Quellen** — In-Memory + `~/.zsh_sessions/*` + `~/.zsh_history`
+3. **Lange Einträge** (>100 Zeichen) interaktiv als Scripts in `~/scripts/` speicherbar
+4. **Secret-Erkennung** via Shannon-Entropie + Pattern-Matching
+5. **Bereinigung**: Nummern, Artefakte, Duplikate, Cursor-Integration
+6. **Schreibt** `~/.zsh_history` + löscht Session-Files
+7. **Lädt** History in aktuellen Terminal-Speicher neu
+
+---
+
+## Zukünftige Erweiterungen (TODO)
+
+- [ ] `history-tracker.sh` — automatischer Export + git commit (via `precmd` Hook)
+- [ ] Forgejo-Sync für `~/scripts/`
+- [ ] Context-Filter: ETSI / local-ai / privat Branches
+- [ ] `.zshrc` Hook: `fc -W` vor jedem Terminal-Schließen automatisch
