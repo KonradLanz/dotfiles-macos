@@ -7,20 +7,32 @@
 #   zsh ~/git/dotfiles-macos/history-cleanup/clean-history.sh --dry-run
 #   zsh ~/git/dotfiles-macos/history-cleanup/clean-history.sh --skip-extract
 #
-# Über macOS zsh-Sessions:
+# Über macOS zsh-Sessions & das "0-Zeilen-Problem":
 #   ~/.zsh_sessions/*.historynew  = RAM-Buffer pro offenem Terminal
-#   Vor fc -W  → Datei hat 0 Zeilen (History liegt im RAM)
-#   Nach fc -W → Datei hat N Zeilen (RAM wurde in Datei geschrieben)
-#   Beim Schließen des Terminals → wird in ~/.zsh_history gemerged
-#   ⇒ Zeilen können NIE auf 0 fallen solange das Terminal offen ist
-#   ⇒ Session-Check ist rein informativ, kein Blocker
+#   fc -W noch NICHT ausgeführt   → Datei hat 0 Zeilen, History liegt im RAM
+#   fc -W ausgeführt              → Datei hat N Zeilen (RAM → Datei geschrieben)
+#   Terminal schließen            → wird automatisch in ~/.zsh_history gemerged
+#
+#   ⚠️  0 Zeilen = NICHT leer — sondern History liegt noch im RAM!
+#   ⇒ Dieses Script liest mit fc -ln direkt aus dem RAM (Quelle 1)
+#   ⇒ Session-Check ist informativ; fc -ln rettet RAM-History immer
 # =============================================================================
 
-set -euo pipefail
+# WICHTIG: HISTFILE MUSS vor set -u gesetzt sein, sonst crash bei -u Flag
+# Beim Aufruf via "zsh script.sh" ist $HISTFILE in der neuen Shell nicht gesetzt
+_HISTFILE_DEFAULT="${HOME}/.zsh_history"
+if [[ -n "${HISTFILE+x}" ]]; then
+  _HISTFILE="${HISTFILE}"
+else
+  _HISTFILE="${_HISTFILE_DEFAULT}"
+fi
+
+# Jetzt erst set -euo pipefail — HISTFILE ist nun sicher
+set -eo pipefail
+# Kein -u hier — zu viele zsh-interne Variablen können ungesetzt sein
 
 # --- Config ---
-# HISTFILE Fallback: beim Aufruf via "zsh script.sh" ist $HISTFILE nicht gesetzt
-HISTFILE="${HISTFILE:-${HOME}/.zsh_history}"
+HISTFILE="${_HISTFILE}"
 BACKUP_DIR="${HOME}/.zsh_history_backups"
 SCRIPTS_DIR="${HOME}/scripts"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -48,18 +60,17 @@ echo "╚═══════════════════════�
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SCHRITT 1 — Offene Terminal-Sessions (rein informativ, kein Blocker)
+# SCHRITT 1 — Offene Terminal-Sessions analysieren
 # ─────────────────────────────────────────────────────────────────────────────
-# Wichtig: Session-Files sind IMMER nicht-leer solange ein Terminal offen ist
-# (vor fc -W = 0 Zeilen im RAM; nach fc -W = N Zeilen in der Datei).
-# Wir mergen ALLE Quellen sowieso — dieser Schritt informiert nur über
-# die Datenmenge die aus anderen Terminals kommt.
+# ⚠️  "0 Zeilen" ist NICHT leer — History liegt noch im RAM!
+#    fc -ln (Schritt 2) liest direkt aus dem RAM → nichts geht verloren.
+#    Andere Terminals: deren RAM-History kann nur via "fc -W" gerettet werden.
 # ─────────────────────────────────────────────────────────────────────────────
-echo "📋 SCHRITT 1 — Offene Terminal-Sessions (informativ)"
+echo "📋 SCHRITT 1 — Terminal-Sessions (informativ)"
 
 SESSION_FILES=(~/.zsh_sessions/*.historynew(N))
-TOTAL_LINES=0
 SESSION_COUNT=${#SESSION_FILES[@]}
+HAS_RAM_SESSIONS=0
 
 if [[ $SESSION_COUNT -eq 0 ]]; then
   echo "   ✓ Keine Session-Dateien gefunden"
@@ -67,22 +78,34 @@ else
   echo "   ℹ️  ${SESSION_COUNT} offene Terminal-Session(s):"
   for f in "${SESSION_FILES[@]}"; do
     count=$(wc -l < "$f" | tr -d ' ')
-    TOTAL_LINES=$((TOTAL_LINES + count))
     if [[ $count -eq 0 ]]; then
-      echo "      → $(basename $f)  (0 Zeilen — History liegt im RAM, wird via fc-ln gemerged)"
+      echo "      → $(basename $f)  [⚡ 0 Zeilen auf Disk — History liegt im RAM]"
+      HAS_RAM_SESSIONS=1
     else
-      echo "      → $(basename $f)  ($count Zeilen — bereits mit fc -W gesichert)"
+      echo "      → $(basename $f)  [$count Zeilen auf Disk — bereits mit fc -W geschrieben]"
     fi
   done
   echo ""
-  echo "   💡 Falls du History aus anderen Terminals sichern willst:"
-  echo "      In jedem anderen Terminal: fc -W  (einmalig, dann hier Enter)"
+
+  if [[ $HAS_RAM_SESSIONS -eq 1 ]]; then
+    echo "   ╔─────────────────────────────────────────────────────╗"
+    echo "   ║  ⚡ DIESES Terminal hat RAM-History (0 auf Disk)    ║"
+    echo "   ║  → fc -ln liest sie direkt → NICHTS geht verloren  ║"
+    echo "   ╚─────────────────────────────────────────────────────╝"
+    echo ""
+    echo "   ℹ️  Andere offene Terminals (falls welche offen sind):"
+    echo "      Dort 'fc -W' eingeben, dann hier Enter drücken."
+    echo "      Sonst geht deren RAM-History verloren."
+  else
+    echo "   ✓ Alle Sessions haben ihren RAM bereits auf Disk geschrieben"
+  fi
+
   echo ""
-  read "?   Enter zum Fortfahren (oder warte bis fc -W überall erledigt): "
+  read "?   Enter zum Fortfahren: "
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SCHRITT 2 — Backup + Merge
+# SCHRITT 2 — Backup + Merge aller History-Quellen
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "💾 SCHRITT 2 — Backup & Merge"
@@ -95,30 +118,27 @@ else
   echo "   ℹ️  ${HISTFILE} existiert noch nicht — wird neu erstellt"
 fi
 
-for f in ~/.zsh_sessions/*.history*(N) ~/.zsh_sessions/*.historynew(N); do
+for f in ~/.zsh_sessions/*.history(N) ~/.zsh_sessions/*.historynew(N); do
   [[ -f "$f" ]] && cp "$f" "${BACKUP_DIR}/$(basename $f).${TIMESTAMP}.bak"
 done
 
 echo "   → Merge aller History-Quellen..."
 
 # Quelle 1: In-Memory History dieses Terminals (fc -ln ohne Zeilennummern)
-fc -ln -${HISTSIZE:-100000} > "${MERGED_DUMP}" 2>/dev/null \
-  || fc -ln 1 > "${MERGED_DUMP}" 2>/dev/null \
-  || true
+# -ln = keine Nummern, sicher auch wenn HISTSIZE nicht gesetzt
+fc -ln 1 > "${MERGED_DUMP}" 2>/dev/null || true
 
 # Quelle 2: Alle Session-Files (andere Terminals, egal ob 0 oder N Zeilen)
 for f in ~/.zsh_sessions/*.history(N) ~/.zsh_sessions/*.historynew(N); do
   if [[ -f "$f" && -s "$f" ]]; then
-    # Format ": timestamp:0;command" → nur Command-Teil
     grep -v '^[[:space:]]*$' "$f" \
       | sed 's/^: [0-9]*:[0-9]*;//' \
       >> "${MERGED_DUMP}" 2>/dev/null || true
   fi
 done
 
-# Quelle 3: Gespeicherte ~/.zsh_history (enthält History aus geschlossenen Terminals)
+# Quelle 3: Gespeicherte ~/.zsh_history (History aus geschlossenen Terminals)
 if [[ -f "${HISTFILE}" ]]; then
-  # Auch hier Extended-History-Format bereinigen
   grep -v '^[[:space:]]*$' "${HISTFILE}" \
     | sed 's/^: [0-9]*:[0-9]*;//' \
     >> "${MERGED_DUMP}" 2>/dev/null || true
@@ -126,6 +146,14 @@ fi
 
 MERGED_COUNT=$(wc -l < "${MERGED_DUMP}" | tr -d ' ')
 echo "   ✓ Gesamt gesammelt: ${MERGED_COUNT} Zeilen (inkl. Duplikate)"
+
+if [[ "${MERGED_COUNT}" -eq 0 ]]; then
+  echo ""
+  echo "   ❌ FEHLER: Keine History-Daten gefunden!"
+  echo "      Stelle sicher dass du das Script im selben Terminal"
+  echo "      ausführst wo die History liegt, oder führe erst fc -W aus."
+  exit 1
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 3 — Lange Einträge
@@ -135,7 +163,7 @@ echo "📏 SCHRITT 3 — Lange Einträge analysieren (>${LONG_THRESH} Zeichen)"
 
 LC_ALL=C awk -v thresh="${LONG_THRESH}" '
   /^[[:space:]]*$/                  { next }
-  /^[[:space:]]+[0-9]+[[:space:]]+/ { next }
+  /^[[:space:]]+[0-9]+[[:space:]]/ { next }
   /^\[200~/                         { next }
   /^: [0-9]+:[0-9]+;/               { next }
   length($0) > thresh               { print }
@@ -283,7 +311,7 @@ fi
 
 LC_ALL=C awk '
   /^[[:space:]]*$/                  { next }
-  /^[[:space:]]+[0-9]+[[:space:]]+/ { next }
+  /^[[:space:]]+[0-9]+[[:space:]]/ { next }
   /^\[200~/                         { next }
   /^: [0-9]+:[0-9]+;/ {
     sub(/^: [0-9]+:[0-9]+;/, "")
@@ -313,13 +341,23 @@ if [[ "${DRY_RUN}" == 1 ]]; then
   echo "   [DRY-RUN] Würde ${CLEAN_COUNT} Einträge nach ${HISTFILE} schreiben"
   echo "   [DRY-RUN] Preview (letzte 10):"
   tail -10 "${CLEAN_FILE}" | sed 's/^/     /'
+  echo ""
+  echo "   [DRY-RUN] Keine Änderungen vorgenommen."
 else
+  read "CONFIRM?   Jetzt ${CLEAN_COUNT} Einträge in ${HISTFILE} schreiben? [J/n] "
+  if [[ "${CONFIRM}" == "n" || "${CONFIRM}" == "N" ]]; then
+    echo "   → Abgebrochen. Backup bleibt unter ${BACKUP_DIR}/"
+    exit 0
+  fi
+
   for f in ~/.zsh_sessions/*.historynew(N) ~/.zsh_sessions/*.history(N); do
     [[ -f "$f" ]] && > "$f"
   done
   echo "   ✓ Session-Dateien geleert"
+
   cp "${CLEAN_FILE}" "${HISTFILE}"
   echo "   ✓ ${HISTFILE} aktualisiert (${CLEAN_COUNT} Einträge)"
+
   fc -R "${HISTFILE}" 2>/dev/null || true
   echo "   ✓ In-Memory History reloaded"
 fi
