@@ -50,6 +50,7 @@ CLEAN_FILE="/tmp/zsh_hist_clean_${TIMESTAMP}.txt"
 SECRET_FILE="/tmp/zsh_hist_secrets_${TIMESTAMP}.txt"
 PENDING_BLOCKS_FILE="/tmp/zsh_hist_pending_${TIMESTAMP}.txt"
 MIN_BLOCK_LINES=3
+LONG_THRESH=200    # Einzelzeilen >= dieser Zeichenanzahl → Schritt 5 Block-Review
 DRY_RUN=0
 SKIP_EXTRACT=0
 
@@ -220,9 +221,15 @@ echo "   ✓ UTF-8 bereinigt"
 # SCHRITT 2b — Block-Erkennung + Dedup
 # BLOCKS_RAW.raw0 = alle Rohblöcke (NUL-separiert)
 # BLOCKS_RAW      = nach Dedup (gleicher normalisierter Inhalt = Duplikat)
+#
+# Zwei Quellen landen in BLOCKS_RAW:
+#   1. Echte Mehrzeiler (enthalten \n im Dump-Format)
+#   2. Superlange Einzelzeilen (>= LONG_THRESH Zeichen) — kein \n, aber
+#      zu komplex für stummes Behalten → manuelles Review in Schritt 5
 # -----------------------------------------------------------------------------
-echo "   → Blöcke erkennen (>= ${MIN_BLOCK_LINES} Zeilen)..."
+echo "   → Blöcke erkennen (>= ${MIN_BLOCK_LINES} Zeilen, oder >= ${LONG_THRESH} Zeichen)..."
 
+# Quelle 1: echte Mehrzeiler (enthalten \n...\n)
 LC_ALL=C grep '\\n.*\\n' "${MERGED_DUMP}" \
   | LC_ALL=C sed \
       -e 's/^[[:space:]]*[0-9]*[[:space:]]*//' \
@@ -230,6 +237,15 @@ LC_ALL=C grep '\\n.*\\n' "${MERGED_DUMP}" \
       -e 's/\\n$//' \
   | LC_ALL=C tr '\n' '\0' \
   > "${BLOCKS_RAW}.raw0" 2>/dev/null || true
+
+# Quelle 2: superlange Einzelzeilen (kein \n, aber >= LONG_THRESH Zeichen)
+LC_ALL=C grep -v '\\n.*\\n' "${MERGED_DUMP}" \
+  | LC_ALL=C awk -v thresh="${LONG_THRESH}" 'length >= thresh' \
+  | LC_ALL=C sed \
+      -e 's/^[[:space:]]*[0-9]*[[:space:]]*//' \
+      -e 's/^: [0-9]*:[0-9]*;//' \
+  | LC_ALL=C tr '\n' '\0' \
+  >> "${BLOCKS_RAW}.raw0" 2>/dev/null || true
 
 # Python-Dedup: Heredoc GEQUOTET ('PYEOF') damit zsh keine Expansion macht.
 # Dateipfade via Umgebungsvariablen übergeben.
@@ -272,10 +288,13 @@ echo "   ✓ Blöcke nach Dedup: ${BLOCK_COUNT}"
 
 # -----------------------------------------------------------------------------
 # SCHRITT 2c — Normalisierung Einzelzeilen
+# Nur kurze Einzelzeilen (< LONG_THRESH Zeichen) landen hier —
+# superlange werden bereits in Schritt 2b nach BLOCKS_RAW geleitet.
 # -----------------------------------------------------------------------------
 echo "   → Normalisierung Einzelzeilen..."
 
 LC_ALL=C grep -v '\\n.*\\n' "${MERGED_DUMP}" \
+  | LC_ALL=C awk -v thresh="${LONG_THRESH}" 'length < thresh' \
   | LC_ALL=C sed -e 's/\\n$//' -e 's/\\n/\n/g' \
   | LC_ALL=C awk '
     /^[[:space:]]*$/  { next }
@@ -333,7 +352,7 @@ SECRET_PATTERNS = [
 FALSE_POSITIVE_PATTERNS = [
     r'^ssh\s+',
     r'^scp\s+',
-    r'^\.zsh_sessions/',
+    r'^\\.zsh_sessions/',
     r'historynew$',
 ]
 TOKEN_WHITELIST = [
@@ -408,7 +427,7 @@ touch "${PENDING_BLOCKS_FILE}"
 
 if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
   echo ""
-  echo "📦 SCHRITT 5 — Mehrzeilige Blöcke extrahieren"
+  echo "📦 SCHRITT 5 — Mehrzeilige Blöcke & lange Einzelbefehle extrahieren"
   [[ "${DRY_RUN}" == 1 ]] && echo "   ⚠️  DRY-RUN: Aktionen simuliert, nichts geschrieben"
   echo "   Blöcke (nach Dedup): ${BLOCK_COUNT}  —  nicht entschiedene kommen in History"
   echo ""
