@@ -33,11 +33,14 @@
 # ─────────────────────────────────────────────────────────────────────────────
 _SCRIPT_DIR="${${(%):-%x}:A:h}"
 if [[ -d "${_SCRIPT_DIR}/../.git" ]]; then
-  _PULL_OUT=$(git -C "${_SCRIPT_DIR}/.." pull --ff-only --quiet 2>&1)
+  _PULL_OUT=$(git -C "${_SCRIPT_DIR}/.." pull --ff-only 2>&1)
   _PULL_RC=$?
   if [[ ${_PULL_RC} -eq 0 ]]; then
-    if [[ -n "${_PULL_OUT}" ]]; then
-      echo "🔄 Script aktualisiert (git pull)"
+    if [[ "${_PULL_OUT}" == *"Already up to date"* ]]; then
+      echo "✓ Script ist aktuell (git pull)"
+    else
+      echo "🔄 Script aktualisiert (git pull):"
+      echo "${_PULL_OUT}" | sed 's/^/   /'
     fi
   else
     echo "⚠️  git pull fehlgeschlagen (offline oder Konflikt) — lokale Version wird verwendet"
@@ -381,7 +384,7 @@ if [[ "${BLOCK_COUNT}" -gt 0 && "${SKIP_EXTRACT}" == 0 ]]; then
 
     echo "   [${BLOCK_IDX}/${BLOCK_COUNT}] Vorgeschlagener Name: ${SUGGESTED}"
     echo "   Preview:"
-    echo "${PREVIEW}" | sed 's/^/     /'
+    print -r -- "${PREVIEW}" | sed 's/^/     /'
     echo ""
 
     if [[ "${SUGGESTED}" == *"_script" && $(echo "${BLOCK}" | grep -c '^#') -eq 0 ]]; then
@@ -504,6 +507,8 @@ fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 5 — Interaktive Extraktion langer Einträge als Scripts
+# fix: print -r -- verhindert Escape-Interpretation von Sonderzeichen
+#      (⃵, \, Backslash-Sequenzen) die echo als Escape interpretiert
 # ─────────────────────────────────────────────────────────────────────────────
 if [[ "${SKIP_EXTRACT}" == 0 && "${LONG_COUNT}" -gt 0 ]]; then
   echo ""
@@ -513,10 +518,10 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${LONG_COUNT}" -gt 0 ]]; then
   INDEX=0
   while IFS= read -r ENTRY; do
     INDEX=$((INDEX + 1))
-    PREVIEW=$(echo "${ENTRY}" | cut -c1-80)
+    PREVIEW="${ENTRY[1,80]}"
     echo ""
-    echo "   [$INDEX/${LONG_COUNT}] (${#ENTRY} Zeichen)"
-    echo "   ${PREVIEW}..."
+    print -r -- "   [${INDEX}/${LONG_COUNT}] (${#ENTRY} Zeichen)"
+    print -r -- "   ${PREVIEW}..."
     echo ""
     echo "   [s] Als Script   [i] In History behalten   [d] Löschen   [q] Abbrechen"
     read "ACTION?   Aktion: "
