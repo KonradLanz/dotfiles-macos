@@ -28,8 +28,6 @@
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 0 — Auto-Pull (Script immer aktuell halten)
-# Fix: ${(%):-%x} gibt den echten Pfad des laufenden Scripts zurück,
-#      unabhängig vom CWD wo der Aufruf stattfindet.
 # ─────────────────────────────────────────────────────────────────────────────
 _SCRIPT_DIR="${${(%):-%x}:A:h}"
 if [[ -d "${_SCRIPT_DIR}/../.git" ]]; then
@@ -262,9 +260,6 @@ fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 2a — UTF-8 Sanitize
-# iconv -c entfernt kaputte Bytefolgen still (ESC-Sequenzen, Bracket-Paste-
-# Reste, Encoding-Artefakte). Valides UTF-8 (Umlaute, Emoji, CJK) bleibt
-# vollständig erhalten. Danach brauchen cut/sort/awk kein LC_ALL=C Workaround.
 # ─────────────────────────────────────────────────────────────────────────────
 echo "   → UTF-8 Sanitize (iconv)..."
 iconv -f UTF-8 -t UTF-8 -c "${MERGED_DUMP}" > "${MERGED_DUMP}.utf8" && \
@@ -298,11 +293,6 @@ echo "   ✓ Normalisiert: ${NORM_COUNT} Zeilen"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 2c — Backslash-Continuation Blöcke extrahieren
-# ─────────────────────────────────────────────────────────────────────────────
-# Blöcke: Zeile endet auf \ → sammeln bis Leerzeile oder Zeile ohne \
-# Ausgabe: NUL-separierte Blöcke in .raw, plain Zeilen in BLOCKS_FILE
-# Block-Zählung: via python3 (macOS awk \x00-Matching unzuverlässig)
-# Block-Loop: liest .raw über fd 3 → stdin bleibt frei für interactive read
 # ─────────────────────────────────────────────────────────────────────────────
 echo "   → Blöcke erkennen..."
 mkdir -p "${SCRIPTS_DIR}"
@@ -507,8 +497,14 @@ fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCHRITT 5 — Interaktive Extraktion langer Einträge als Scripts
-# fix: print -r -- verhindert Escape-Interpretation von Sonderzeichen
-#      (⃵, \, Backslash-Sequenzen) die echo als Escape interpretiert
+#
+# Kernproblem bisher: "done < LONG_FILE" legte LONG_FILE auf stdin.
+# Dadurch las "read ACTION" aus der Datei statt von der Tastatur —
+# bei EOF (letzter Eintrag ohne trailing newline) bekam read einen
+# leeren String, traf den *-Zweig nicht mehr und der Loop endete still.
+#
+# Fix: LONG_FILE über fd 4 einlesen (wie BLOCKS_FILE.raw über fd 3).
+# stdin (/dev/tty) bleibt damit frei für alle interaktiven read-Aufrufe.
 # ─────────────────────────────────────────────────────────────────────────────
 if [[ "${SKIP_EXTRACT}" == 0 && "${LONG_COUNT}" -gt 0 ]]; then
   echo ""
@@ -516,7 +512,8 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${LONG_COUNT}" -gt 0 ]]; then
   mkdir -p "${SCRIPTS_DIR}"
 
   INDEX=0
-  while IFS= read -r ENTRY; do
+  exec 4< "${LONG_FILE}"
+  while IFS= read -r ENTRY <&4; do
     INDEX=$((INDEX + 1))
     PREVIEW="${ENTRY[1,80]}"
     echo ""
@@ -557,7 +554,8 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${LONG_COUNT}" -gt 0 ]]; then
         echo "   → Behalten"
         ;;
     esac
-  done < "${LONG_FILE}"
+  done
+  exec 4<&-
 else
   [[ "${SKIP_EXTRACT}" == 1 ]] && echo "   → Übersprungen (--skip-extract)"
 fi
