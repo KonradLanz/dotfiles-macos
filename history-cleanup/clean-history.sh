@@ -56,8 +56,14 @@ PENDING_BLOCKS_FILE="/tmp/zsh_hist_pending_${TIMESTAMP}.txt"
 MIN_BLOCK_LINES=3
 LONG_THRESH=200    # Einzelzeilen >= dieser Zeichenanzahl → Schritt 5 Block-Review
 MAX_LINE_LEN=500   # Einzelzeilen (non-backslash) > dieser Zeichenanzahl → in Backup sichern + entfernen
-OLLAMA_BASE_URL="http://localhost:11434"  # local-ai-stack Ollama endpoint
-OLLAMA_MODEL="llama3.1:8b"               # Modell aus local-ai-stack .env.example
+
+# --- AI Backend Config (local-ai-stack) ---
+# Priorität: Ollama → LM Studio → Regex-Fallback
+OLLAMA_BASE_URL="http://localhost:11434"
+OLLAMA_MODEL="llama3.1:8b"
+LMSTUDIO_BASE_URL="http://localhost:1234/v1"
+# LMSTUDIO_MODEL wird automatisch ermittelt (erster geladener Slot)
+
 DRY_RUN=0
 SKIP_EXTRACT=0
 
@@ -86,103 +92,173 @@ ask() {
 }
 
 # -----------------------------------------------------------------------------
-# Hilfsfunktion: Ollama-Verfügbarkeit prüfen (kein Start, nur Check)
-# Gibt 0 zurück wenn Ollama antwortet, 1 sonst.
+# Hilfsfunktion: Ollama-Verfügbarkeit prüfen
 # -----------------------------------------------------------------------------
 _ollama_available() {
   curl -sf --max-time 2 "${OLLAMA_BASE_URL}/api/tags" >/dev/null 2>&1
 }
 
 # -----------------------------------------------------------------------------
-# Hilfsfunktion: AI-Namenvorschlag via Ollama (local-ai-stack)
-#
-# Prüft ob Ollama läuft. Falls nicht → versucht einmalig `ollama serve`
-# im Hintergrund zu starten und wartet max. 5s.
-# Bei Erfolg: liefert einen snake_case-Dateinamen (ohne Datum, ohne .sh).
-# Bei Fehler/Timeout: gibt leeren String zurück → Caller fällt auf
-# _derive_script_name_fallback() zurück.
+# Hilfsfunktion: LM Studio-Verfügbarkeit prüfen
+# LM Studio spricht die OpenAI-API auf Port 1234.
+# Gibt 0 zurück wenn ein Modell geladen ist (models-Liste nicht leer).
 # -----------------------------------------------------------------------------
-_OLLAMA_CHECKED=0   # 0 = noch nicht geprüft, 1 = verfügbar, 2 = nicht verfügbar
+_lmstudio_available() {
+  local models
+  models=$(curl -sf --max-time 2 "${LMSTUDIO_BASE_URL}/models" 2>/dev/null)
+  [[ -n "${models}" ]] && echo "${models}" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print('ok' if d.get('data') else '')
+except: pass
+" 2>/dev/null | grep -q 'ok'
+}
 
-_derive_script_name_ai() {
-  local block="$1"
+# Ermittelt den Namen des ersten geladenen LM Studio-Modells
+_lmstudio_model() {
+  curl -sf --max-time 2 "${LMSTUDIO_BASE_URL}/models" 2>/dev/null | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    models = d.get('data', [])
+    print(models[0]['id'] if models else '')
+except: pass
+" 2>/dev/null
+}
 
-  # Ollama-Status gecacht damit wir nicht bei jedem Block neu prüfen
-  if [[ "${_OLLAMA_CHECKED}" -eq 0 ]]; then
-    if _ollama_available; then
-      _OLLAMA_CHECKED=1
-      echo "   🤖 Ollama verfügbar — AI-Namenvorschläge aktiv (${OLLAMA_MODEL})" >&2
-    else
-      # Einmalig versuchen zu starten
-      echo "   🤖 Ollama nicht aktiv — versuche zu starten..." >&2
-      ollama serve >/dev/null 2>&1 &
-      local waited=0
-      while [[ ${waited} -lt 5 ]]; do
-        sleep 1; waited=$(( waited + 1 ))
-        _ollama_available && break
-      done
-      if _ollama_available; then
-        _OLLAMA_CHECKED=1
-        echo "   🤖 Ollama gestartet — AI-Namenvorschläge aktiv (${OLLAMA_MODEL})" >&2
-      else
-        _OLLAMA_CHECKED=2
-        echo "   ⚠️  Ollama nicht erreichbar — Fallback auf Regex-Namen" >&2
-      fi
-    fi
+# -----------------------------------------------------------------------------
+# AI-Backend-Status (gecacht, wird einmalig beim ersten Block ermittelt)
+# Werte: 0=ungeprüft  1=Ollama  2=LMStudio  3=kein AI
+# -----------------------------------------------------------------------------
+_AI_BACKEND=0
+_AI_BACKEND_LABEL=""
+
+_detect_ai_backend() {
+  [[ "${_AI_BACKEND}" -ne 0 ]] && return
+
+  # 1. Ollama prüfen
+  if _ollama_available; then
+    _AI_BACKEND=1
+    _AI_BACKEND_LABEL="Ollama (${OLLAMA_MODEL})"
+    echo "   🤖 AI-Backend: ${_AI_BACKEND_LABEL}" >&2
+    return
   fi
 
-  [[ "${_OLLAMA_CHECKED}" -ne 1 ]] && return 1
+  # Ollama nicht aktiv → einmalig versuchen zu starten
+  echo "   🤖 Ollama nicht aktiv — versuche zu starten..." >&2
+  ollama serve >/dev/null 2>&1 &
+  local waited=0
+  while [[ ${waited} -lt 5 ]]; do
+    sleep 1; waited=$(( waited + 1 ))
+    if _ollama_available; then
+      _AI_BACKEND=1
+      _AI_BACKEND_LABEL="Ollama (${OLLAMA_MODEL}) [neu gestartet]"
+      echo "   🤖 AI-Backend: ${_AI_BACKEND_LABEL}" >&2
+      return
+    fi
+  done
 
-  # Ersten 8 Zeilen des Blocks als Kontext (Sonderzeichen escapen)
+  # 2. LM Studio prüfen
+  if _lmstudio_available; then
+    local lm_model
+    lm_model=$(_lmstudio_model)
+    _AI_BACKEND=2
+    _AI_BACKEND_LABEL="LM Studio (${lm_model:-unbekannt})"
+    echo "   🤖 AI-Backend: ${_AI_BACKEND_LABEL}" >&2
+    return
+  fi
+
+  # 3. Kein AI verfügbar
+  _AI_BACKEND=3
+  echo "   ⚠️  Kein AI-Backend erreichbar — Fallback auf Regex-Namen" >&2
+}
+
+# -----------------------------------------------------------------------------
+# Hilfsfunktion: AI-Namenvorschlag
+# Unterstützt Ollama (/api/generate) und LM Studio (OpenAI /chat/completions).
+# Gibt leeren String zurück bei Fehler → Caller fällt auf Regex-Fallback zurück.
+# -----------------------------------------------------------------------------
+_derive_script_name_ai() {
+  local block="$1"
+  _detect_ai_backend
+
+  [[ "${_AI_BACKEND}" -eq 3 ]] && return 1
+
   local preview
   preview=$(printf '%s' "${block}" | head -8 | \
-    python3 -c "
-import sys, json
-lines = sys.stdin.read()
-print(json.dumps(lines))
-" 2>/dev/null) || return 1
+    python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" 2>/dev/null) || return 1
 
-  local prompt="Reply with ONLY a short snake_case filename (max 4 words, no extension, no date prefix, lowercase, underscores only). No explanation. Script content:\n${preview}"
+  local sys_prompt="Reply with ONLY a short snake_case filename (max 4 words, no extension, no date prefix, lowercase, underscores only). No explanation."
+  local user_prompt="Script content: ${preview}"
+  local name raw_result
 
-  local raw_result
-  raw_result=$(curl -sf --max-time 8 \
-    "${OLLAMA_BASE_URL}/api/generate" \
-    -H 'Content-Type: application/json' \
-    -d "$(python3 -c "
-import json, sys
+  if [[ "${_AI_BACKEND}" -eq 1 ]]; then
+    # --- Ollama: /api/generate ---
+    raw_result=$(curl -sf --max-time 8 \
+      "${OLLAMA_BASE_URL}/api/generate" \
+      -H 'Content-Type: application/json' \
+      -d "$(python3 -c "
+import json
 print(json.dumps({
   'model': '${OLLAMA_MODEL}',
-  'prompt': ${prompt},
+  'prompt': ${preview},
+  'system': '${sys_prompt}',
   'stream': False,
   'options': {'num_predict': 15, 'temperature': 0.1}
 }))
 " 2>/dev/null)" 2>/dev/null) || return 1
 
-  local name
-  name=$(printf '%s' "${raw_result}" | \
-    python3 -c "
+    name=$(printf '%s' "${raw_result}" | python3 -c "
 import sys, json, re
 try:
-    d = json.load(sys.stdin)
-    s = d.get('response','').strip()
-    # Nur den ersten Token nehmen, alles bereinigen
+    s = json.load(sys.stdin).get('response','').strip()
     s = re.sub(r'[^a-z0-9_]+', '_', s.lower())
     s = re.sub(r'_+', '_', s).strip('_')
     print(s[:40])
 except: pass
 " 2>/dev/null)
 
+  elif [[ "${_AI_BACKEND}" -eq 2 ]]; then
+    # --- LM Studio: OpenAI /chat/completions ---
+    local lm_model
+    lm_model=$(_lmstudio_model)
+    raw_result=$(curl -sf --max-time 8 \
+      "${LMSTUDIO_BASE_URL}/chat/completions" \
+      -H 'Content-Type: application/json' \
+      -d "$(python3 -c "
+import json
+print(json.dumps({
+  'model': '${lm_model}',
+  'messages': [
+    {'role': 'system', 'content': '${sys_prompt}'},
+    {'role': 'user',   'content': 'Script content: ' + ${preview}}
+  ],
+  'max_tokens': 15,
+  'temperature': 0.1,
+  'stream': False
+}))
+" 2>/dev/null)" 2>/dev/null) || return 1
+
+    name=$(printf '%s' "${raw_result}" | python3 -c "
+import sys, json, re
+try:
+    s = json.load(sys.stdin)['choices'][0]['message']['content'].strip()
+    s = re.sub(r'[^a-z0-9_]+', '_', s.lower())
+    s = re.sub(r'_+', '_', s).strip('_')
+    print(s[:40])
+except: pass
+" 2>/dev/null)
+  fi
+
   [[ -n "${name}" ]] && echo "${name}" || return 1
 }
 
 # -----------------------------------------------------------------------------
-# Hilfsfunktion: Regex-Fallback für Script-Name (bisherige Logik, acook-Bug gefixt)
-# Fix: tr '[:upper:]' '[:lower:]' VOR tr -cd damit Grossbuchstaben nicht einfach
-# wegfallen ("MacBook" → "macbook" statt "acook").
+# Hilfsfunktion: Regex-Fallback für Script-Name (acook-Bug gefixt)
 # -----------------------------------------------------------------------------
 _derive_script_name_fallback() {
   local block="$1" date_prefix=$(date +%Y%m%d) name=""
-  # Kommentarzeile als Quelle: Grossbuchstaben → Klein, dann filtern
   name=$(echo "${block}" | LC_ALL=C sed 's/\\n/\n/g' | grep '^#' | head -1 \
     | sed 's/^#[[:space:]]*//' \
     | tr '[:upper:]' '[:lower:]' \
@@ -190,7 +266,6 @@ _derive_script_name_fallback() {
     | tr -cd 'a-z0-9-' \
     | sed 's/-\{2,\}/-/g' \
     | cut -c1-30)
-  # Fallback: erster Befehl
   if [[ -z "${name}" ]]; then
     name=$(echo "${block}" | LC_ALL=C sed 's/\\n/\n/g' | grep -v '^#' | head -1 \
       | awk '{print $1}' \
