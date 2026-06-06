@@ -646,11 +646,15 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
 
   _show_block_lines() {
     local display="$1" total_lines=$2 idx=$3 total_blocks=$4 from_line=$5 suggested=$6 lm_source=$7
+    # from_line ist 0-basiert; show_to ist die letzte angezeigte Zeile (0-basiert, exklusiv)
     local show_to=$(( from_line + 10 ))
     [[ ${show_to} -gt ${total_lines} ]] && show_to=${total_lines}
+    # Für Anzeige: 1-basierte Zeilennummern
+    local display_from=$(( from_line + 1 ))
+    local display_to=${show_to}   # show_to ist bereits die letzte angezeigte Zeile (1-basiert inklusiv)
     echo "   +----------------------------------------------------------+"
     printf "   |  Block [%d/%d] — %d Zeilen  (Zeilen %d–%d)\n" \
-      ${idx} ${total_blocks} ${total_lines} $(( from_line + 1 )) ${show_to}
+      ${idx} ${total_blocks} ${total_lines} ${display_from} ${display_to}
     if [[ -n "${suggested}" ]]; then
       printf "   |  🏷  Vorschlag [%s]: %s\n" "${lm_source}" "${suggested}"
     else
@@ -658,7 +662,7 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
     fi
     echo "   +----------------------------------------------------------+"
     printf '%s\n' "${display}" \
-      | tail -n +$(( from_line + 1 )) \
+      | tail -n +${display_from} \
       | head -n 10 \
       | while IFS= read -r ln; do printf "   | %.88s\n" "${ln}"; done
     [[ ${show_to} -lt ${total_lines} ]] && \
@@ -672,7 +676,11 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
     [[ -z "${BLOCK_RAW// }" ]] && continue
 
     BLOCK_DISPLAY=$(printf '%s' "${BLOCK_RAW}" | LC_ALL=C sed 's/\\n/\n/g')
+    # printf '%s' (ohne \n am Ende) → wc -l zählt exakt die echten Zeilenumbrüche
     BLOCK_LINES=$(printf '%s' "${BLOCK_DISPLAY}" | wc -l | tr -d ' ')
+    # Ein Block ohne abschließenden Newline hat BLOCK_LINES = Anzahl \n = Zeilen-1
+    # → +1 damit die letzte Zeile mitgezählt wird
+    BLOCK_LINES=$(( BLOCK_LINES + 1 ))
     [[ "${BLOCK_LINES}" -lt "${MIN_BLOCK_LINES}" ]] && \
       printf '%s\n' "${BLOCK_DISPLAY}" >> "${PENDING_BLOCKS_FILE}" && continue
 
