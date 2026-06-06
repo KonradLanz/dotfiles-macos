@@ -101,10 +101,16 @@ echo ""
 # -----------------------------------------------------------------------------
 
 # Einfache Eingabe (kein Readline) — für Ja/Nein-Fragen
+# FIX: Strg+C während read → Terminal sauber zurücksetzen, dann exit
 ask() {
   local _var="$1" _prompt="$2" _reply
+  # Strg+C während read: Terminal-Modus wiederherstellen, dann sauber beenden
+  trap 'echo ""; stty sane 2>/dev/null; exit 130' INT
   IFS= read -r "_reply?${_prompt}" < /dev/tty
+  local _rc=$?
+  trap '_cleanup_all_tmp' INT
   typeset -g "${_var}"="${_reply}"
+  return ${_rc}
 }
 
 # Editierbare Eingabe mit vorausgefülltem Wert — zsh-nativ via vared.
@@ -137,6 +143,7 @@ _cleanup_less_tmp() {
 
 # Alle /tmp-Dateien dieses Laufs entfernen — aufgerufen via trap und am Ende.
 _cleanup_all_tmp() {
+  stty sane 2>/dev/null
   rm -f "${MERGED_DUMP}" "${BLOCKS_RAW}" "${BLOCKS_RAW}.raw0" \
         "${SINGLES_FILE}" "${CLEAN_FILE}" "${SECRET_FILE}" \
         "${ENTRIES_TO_DELETE:-}" "${PENDING_BLOCKS_FILE}" \
@@ -875,6 +882,16 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
           break
           ;;
 
+        i|I)
+          if [[ "${DRY_RUN}" != 1 ]]; then
+            printf '%s\n' "${BLOCK_DISPLAY}" >> "${SINGLES_FILE}"
+          fi
+          echo "   → In History behalten"
+          KEPT_COUNT=$(( KEPT_COUNT + 1 ))
+          echo ""
+          break
+          ;;
+
         d|D)
           echo "   → Gelöscht"
           DELETED_COUNT=$(( DELETED_COUNT + 1 ))
@@ -1141,6 +1158,13 @@ APPLESCRIPT_FCR
       && echo "   ✓ rdfind: ${_DELETED_DUPS} doppelte Backup(s) gelöscht" \
       || echo "   ✓ rdfind: keine Duplikate gefunden"
     rm -f "${BACKUP_DIR}/results.txt" 2>/dev/null || true
+  fi
+
+  # FIX: Leere Dateien im Backup-Verzeichnis löschen (z.B. leere Session-Backups)
+  _EMPTY_COUNT=$(find "${BACKUP_DIR}" -maxdepth 1 -type f -empty 2>/dev/null | wc -l | tr -d ' ')
+  if [[ "${_EMPTY_COUNT}" -gt 0 ]]; then
+    find "${BACKUP_DIR}" -maxdepth 1 -type f -empty -delete 2>/dev/null || true
+    echo "   ✓ ${_EMPTY_COUNT} leere Backup-Datei(en) gelöscht"
   fi
 fi
 
