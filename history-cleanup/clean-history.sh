@@ -64,6 +64,13 @@ LM_API_URL="http://localhost:1234/v1/chat/completions"
 LM_MODEL=""   # leer = LM Studio wählt aktiv geladenes Modell
 LM_TIMEOUT=15 # Sekunden bis Timeout (lokales Modell braucht manchmal länger)
 
+# Persönliche Details — fließen in den KI-Prompt ein (z.B. Email → Dateiname)
+# Trage hier deine eigenen Werte ein; leere Werte werden nicht übertragen.
+LM_USER_CONTEXT_NAME="Konrad Lanz"          # Vollständiger Name
+LM_USER_CONTEXT_EMAIL="konrad@greev.com"    # Primäre Email
+LM_USER_CONTEXT_GITHUB="KonradLanz"         # GitHub-Handle
+LM_USER_CONTEXT_EXTRA=""                    # Freier Zusatz-Kontext (z.B. Firma, Projekte)
+
 for arg in "$@"; do
   case "$arg" in
     --dry-run)      DRY_RUN=1 ;;
@@ -80,12 +87,29 @@ echo "╚═══════════════════════�
 echo ""
 
 # -----------------------------------------------------------------------------
-# Hilfsfunktion: User-Eingabe immer von /dev/tty
+# Hilfsfunktionen
 # -----------------------------------------------------------------------------
+
+# Einfache Eingabe (kein Readline) — für Ja/Nein-Fragen
 ask() {
   local _var="$1" _prompt="$2" _reply
   IFS= read -r "_reply?${_prompt}" < /dev/tty
   typeset -g "${_var}"="${_reply}"
+}
+
+# Editierbare Eingabe mit Readline und vorausgefülltem Wert (read -e -i)
+# Fallback auf einfaches ask() falls read -e nicht verfügbar.
+ask_edit() {
+  local _var="$1" _prompt="$2" _default="$3" _reply
+  # read -e aktiviert Readline; -i setzt den vorausgefüllten Wert
+  if read -e -i "${_default}" "_reply?${_prompt}" </dev/tty 2>/dev/null; then
+    typeset -g "${_var}"="${_reply}"
+  else
+    # Fallback: klassisches ask ohne Readline
+    printf '%s[%s]: ' "${_prompt%: }" "${_default}" > /dev/tty
+    IFS= read -r "_reply" < /dev/tty
+    typeset -g "${_var}"="${_reply:-${_default}}"
+  fi
 }
 
 # -----------------------------------------------------------------------------
@@ -492,28 +516,39 @@ fi
 
 # -----------------------------------------------------------------------------
 # SCHRITT 4 — Script-Name ableiten (lokaler Fallback)
+# Extrahiert auch Repo-Namen aus dem Block (git-Befehle, cd-Pfade, URLs)
 # -----------------------------------------------------------------------------
 _derive_script_name() {
-  local block="$1" date_prefix=$(date +%Y%m%d) name=""
-  name=$(echo "${block}" | LC_ALL=C sed 's/\\n/\n/g' | grep '^#' | head -1 \
-    | sed 's/^#[[:space:]]*//' | tr ' ' '-' | tr -cd 'a-z0-9-' | cut -c1-30)
+  local block="$1" date_prefix=$(date +%Y%m%d) name="" repo=""
+
+  # Repo-Name aus Block extrahieren (github.com/X/REPO, cd .../REPO, git clone)
+  repo=$(printf '%s' "${block}" | LC_ALL=C sed 's/\\n/\n/g' \
+    | LC_ALL=C grep -Eo '(github\.com/[^/]+/([^/" ]+)|cd[[:space:]]+[^/]*/([-a-z0-9_]+)|git[[:space:]]+clone[[:space:]]+[^/]+/([-a-z0-9_]+))' \
+    | LC_ALL=C sed 's|.*/([-a-z0-9_]*)$|\1|' \
+    | head -1 | tr -cd 'a-z0-9-' | cut -c1-20)
+
+  name=$(printf '%s' "${block}" | LC_ALL=C sed 's/\\n/\n/g' | grep '^#' | head -1 \
+    | sed 's/^#[[:space:]]*//' | tr ' ' '_' | tr -cd 'a-z0-9_-' | cut -c1-30)
   if [[ -z "${name}" ]]; then
-    name=$(echo "${block}" | LC_ALL=C sed 's/\\n/\n/g' | grep -v '^#' | head -1 \
+    name=$(printf '%s' "${block}" | LC_ALL=C sed 's/\\n/\n/g' | grep -v '^#' | head -1 \
       | awk '{print $1}' | tr -cd 'a-z0-9_-' | cut -c1-20)
   fi
   [[ -z "${name}" ]] && name="script"
-  echo "${date_prefix}_${name}"
+
+  if [[ -n "${repo}" && "${name}" != *"${repo}"* ]]; then
+    echo "${date_prefix}_${repo}_${name}"
+  else
+    echo "${date_prefix}_${name}"
+  fi
 }
 
 # -----------------------------------------------------------------------------
 # LM Studio Namensvorschlag via lokale API
 #
-# Status wird direkt auf /dev/tty geschrieben (nicht stderr/stdout)
-# damit er immer sichtbar ist, auch wenn stdout umgeleitet ist.
-# Nach Abschluss wird die Statuszeile mit Leerzeichen überschrieben.
-#
-# Rückgabe: "DATUM_snake_case_name" oder "" bei Fehler/Timeout
-# Fallback: _derive_script_name (lokaler Algorithmus)
+# - Repo-Namen aus dem Block werden automatisch erkannt und dem Prompt beigefügt
+# - Persönliche Details (Email, Name) fließen als Kontext ein
+# - Status auf /dev/tty (immer sichtbar, wird danach gelöscht)
+# - Fallback: _derive_script_name
 # -----------------------------------------------------------------------------
 _lm_suggest_name() {
   local block="$1"
@@ -522,17 +557,39 @@ _lm_suggest_name() {
   # Status anzeigen (auf /dev/tty — immer sichtbar)
   printf '   ⏳ KI-Namensvorschlag wird geholt (max %ds)...' "${LM_TIMEOUT}" > /dev/tty
 
-  # Ersten 800 Zeichen als Kontext, JSON-Sonderzeichen escapen
-  local snippet
+  # Repo-Namen aus Block extrahieren
+  local repo_hint
+  repo_hint=$(printf '%s' "${block}" \
+    | LC_ALL=C grep -Eo '(github\.com/[^/]+/[^/" ]+|entware-packages|entware-work|dotfiles[-a-z]*|[-a-z0-9]+\.git)' \
+    | LC_ALL=C sed 's|\.git$||' | sort -u | head -3 | tr '\n' ' ' | xargs)
+
+  # Persönlichen Kontext zusammenbauen
+  local user_ctx=""
+  [[ -n "${LM_USER_CONTEXT_NAME}"   ]] && user_ctx+="User: ${LM_USER_CONTEXT_NAME}. "
+  [[ -n "${LM_USER_CONTEXT_EMAIL}"  ]] && user_ctx+="Email: ${LM_USER_CONTEXT_EMAIL}. "
+  [[ -n "${LM_USER_CONTEXT_GITHUB}" ]] && user_ctx+="GitHub: ${LM_USER_CONTEXT_GITHUB}. "
+  [[ -n "${LM_USER_CONTEXT_EXTRA}"  ]] && user_ctx+="${LM_USER_CONTEXT_EXTRA}. "
+  [[ -n "${repo_hint}"              ]] && user_ctx+="Repos mentioned: ${repo_hint}. "
+
+  # System-Prompt mit Kontext
+  local sys_prompt
+  sys_prompt=$(printf '%s' \
+    "Reply with ONLY a single snake_case filename token (no extension, no explanation, 2-6 words max). " \
+    "If a repo name is clearly mentioned in the script, include it in the name. " \
+    "If a personal identifier (email domain, username) appears, include a short form. " \
+    "Example: entware_packages_gh_build, greev_ssh_key_setup, dotfiles_git_sync. " \
+    "${user_ctx}")
+
+  # JSON escapen
+  local snippet sys_json
   snippet=$(printf '%s' "${block}" | head -c 800 \
-    | python3 -c "
-import sys, json
-print(json.dumps(sys.stdin.read())[1:-1])
-" 2>/dev/null) || snippet=""
+    | python3 -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])" 2>/dev/null) || snippet=""
+  sys_json=$(printf '%s' "${sys_prompt}" \
+    | python3 -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])" 2>/dev/null) || sys_json=""
 
   local payload
-  payload=$(printf '{"model":"%s","max_tokens":20,"temperature":0.1,"messages":[{"role":"system","content":"Reply with ONLY a single snake_case filename (no extension, no explanation, 2-5 words). Example: entware_gh_build_deploy"},{"role":"user","content":"Name this shell script:\\n\\n%s"}]}' \
-    "${LM_MODEL}" "${snippet}")
+  payload=$(printf '{"model":"%s","max_tokens":25,"temperature":0.1,"messages":[{"role":"system","content":"%s"},{"role":"user","content":"Name this shell script:\\n\\n%s"}]}' \
+    "${LM_MODEL}" "${sys_json}" "${snippet}")
 
   local raw_response
   raw_response=$(curl -sf \
@@ -544,9 +601,7 @@ print(json.dumps(sys.stdin.read())[1:-1])
   # Statuszeile löschen
   printf '\r%-60s\r' '' > /dev/tty
 
-  if [[ -z "${raw_response}" ]]; then
-    return
-  fi
+  [[ -z "${raw_response}" ]] && return
 
   local name
   name=$(printf '%s' "${raw_response}" \
@@ -555,18 +610,15 @@ import sys, json, re
 try:
     data = json.load(sys.stdin)
     text = data['choices'][0]['message']['content'].strip()
-    # Ersten snake_case Token nehmen, Rest wegwerfen
     token = re.split(r'[\\s:,\"\x60\\(\\)]+', text.strip('\"\x60 '))[0]
     token = re.sub(r'[^a-z0-9_-]', '_', token.lower()).strip('_')
-    token = re.sub(r'_+', '_', token)[:40]
+    token = re.sub(r'_+', '_', token)[:50]
     print(token if len(token) >= 3 else '')
 except:
     print('')
 " 2>/dev/null) || name=""
 
-  if [[ -n "${name}" ]]; then
-    echo "${date_prefix}_${name}"
-  fi
+  [[ -n "${name}" ]] && echo "${date_prefix}_${name}"
 }
 
 mkdir -p "${SCRIPTS_DIR}"
@@ -582,6 +634,8 @@ fi
 #   2. KI-Vorschlag holen (Status auf /dev/tty, danach gelöscht)
 #   3. Block-Header MIT Vorschlag anzeigen
 #   4. Aktion wählen
+#   Bei [s]: Name editierbar vorausgefüllt (read -e -i)
+#            Nach Speichern: "cat <script>  # → zsh zum Ausführen" in History
 # -----------------------------------------------------------------------------
 touch "${PENDING_BLOCKS_FILE}"
 
@@ -630,7 +684,7 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
 
     BLOCK_IDX=$(( BLOCK_IDX + 1 ))
 
-    # ── KI-Vorschlag holen (Status sichtbar auf /dev/tty) ───────────────────
+    # ── KI-Vorschlag holen (Status sichtbar auf /dev/tty) ──────────────────
     LM_SUGGESTED=$(_lm_suggest_name "${BLOCK_DISPLAY}")
     if [[ -n "${LM_SUGGESTED}" ]]; then
       SUGGESTED="${LM_SUGGESTED}"
@@ -639,7 +693,7 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
       SUGGESTED=$(_derive_script_name "${BLOCK_RAW}")
       LM_SOURCE="lokal"
     fi
-    # ───────────────────────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────────────────
 
     PREVIEW_FROM=0
     _show_block_lines "${BLOCK_DISPLAY}" ${BLOCK_LINES} \
@@ -676,13 +730,15 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
           ;;
 
         s|S)
-          ask SNAME "   Name [${SUGGESTED}]: "
+          # ── Editierbare Namenseingabe (Vorschlag vorausgefüllt, Cursor editierbar)
+          ask_edit SNAME "   Name: " "${SUGGESTED}"
           SNAME="${SNAME:-${SUGGESTED}}"
           [[ "${SNAME}" != *.sh ]] && SNAME="${SNAME}.sh"
           [[ ! "${SNAME}" =~ ^[0-9]{8}_ ]] && SNAME="$(date +%Y%m%d)_${SNAME}"
           SPATH="${SCRIPTS_DIR}/${SNAME}"
           if [[ "${DRY_RUN}" == 1 ]]; then
             echo "   [DRY-RUN] Würde speichern: ${SPATH}"
+            echo "   [DRY-RUN] History-Eintrag: cat ${SPATH}  # → zsh zum Ausführen"
           else
             printf '#!/usr/bin/env zsh\n# Extracted: %s\n# From: zsh history cleanup\n# ---\n\n%s\n' \
               "$(date '+%Y-%m-%d %H:%M')" "${BLOCK_DISPLAY}" > "${SPATH}"
@@ -690,6 +746,10 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
             git -C "${SCRIPTS_DIR}" add "${SNAME}" 2>/dev/null || true
             git -C "${SCRIPTS_DIR}" commit -m "extract: ${SNAME}" --quiet 2>/dev/null || true
             echo "   ✓ Gespeichert: ${SPATH}"
+            # cat-Aufruf in die zsh-History schreiben
+            # (Hinweis-Kommentar: cat → zsh tauschen um auszuführen)
+            print -s "cat ${SPATH}  # → zsh ${SPATH} zum Ausführen"
+            echo "   ✓ History: cat ${SPATH}  # → zsh ${SPATH} zum Ausführen"
           fi
           EXTRACTED_COUNT=$(( EXTRACTED_COUNT + 1 ))
           echo ""
