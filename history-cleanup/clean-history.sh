@@ -97,19 +97,19 @@ ask() {
   typeset -g "${_var}"="${_reply}"
 }
 
-# Editierbare Eingabe mit Readline und vorausgefülltem Wert (read -e -i)
-# Fallback auf einfaches ask() falls read -e nicht verfügbar.
+# Editierbare Eingabe mit vorausgefülltem Wert — zsh-nativ via vared.
+# vared erlaubt Cursor-Navigation und Backspace in der Eingabezeile.
+# Der Prompt wird vorher auf /dev/tty geschrieben; vared selbst
+# zeigt nur den editierbaren Inhalt.
 ask_edit() {
-  local _var="$1" _prompt="$2" _default="$3" _reply
-  # read -e aktiviert Readline; -i setzt den vorausgefüllten Wert
-  if read -e -i "${_default}" "_reply?${_prompt}" </dev/tty 2>/dev/null; then
-    typeset -g "${_var}"="${_reply}"
-  else
-    # Fallback: klassisches ask ohne Readline
-    printf '%s[%s]: ' "${_prompt%: }" "${_default}" > /dev/tty
-    IFS= read -r "_reply" < /dev/tty
-    typeset -g "${_var}"="${_reply:-${_default}}"
-  fi
+  local _var="$1" _prompt="$2" _default="$3"
+  # Lokale Kopie des Defaultwertes — vared editiert die Variable in-place
+  local _reply="${_default}"
+  printf '%s' "${_prompt}" > /dev/tty
+  # vared liest von /dev/tty und schreibt das Ergebnis direkt in _reply
+  vared -p '' _reply < /dev/tty > /dev/tty 2>/dev/null
+  # Falls vared fehlschlug oder leer: Fallback auf Default
+  typeset -g "${_var}"="${_reply:-${_default}}"
 }
 
 # -----------------------------------------------------------------------------
@@ -524,7 +524,7 @@ _derive_script_name() {
   # Repo-Name aus Block extrahieren (github.com/X/REPO, cd .../REPO, git clone)
   repo=$(printf '%s' "${block}" | LC_ALL=C sed 's/\\n/\n/g' \
     | LC_ALL=C grep -Eo '(github\.com/[^/]+/([^/" ]+)|cd[[:space:]]+[^/]*/([-a-z0-9_]+)|git[[:space:]]+clone[[:space:]]+[^/]+/([-a-z0-9_]+))' \
-    | LC_ALL=C sed 's|.*/([-a-z0-9_]*)$|\1|' \
+    | LC_ALL=C sed 's|.*/\([-a-z0-9_]*\)$|\1|' \
     | head -1 | tr -cd 'a-z0-9-' | cut -c1-20)
 
   name=$(printf '%s' "${block}" | LC_ALL=C sed 's/\\n/\n/g' | grep '^#' | head -1 \
@@ -610,7 +610,7 @@ import sys, json, re
 try:
     data = json.load(sys.stdin)
     text = data['choices'][0]['message']['content'].strip()
-    token = re.split(r'[\\s:,\"\x60\\(\\)]+', text.strip('\"\x60 '))[0]
+    token = re.split(r'[\s:,\"\x60\(\)]+', text.strip('\"\x60 '))[0]
     token = re.sub(r'[^a-z0-9_-]', '_', token.lower()).strip('_')
     token = re.sub(r'_+', '_', token)[:50]
     print(token if len(token) >= 3 else '')
@@ -634,7 +634,7 @@ fi
 #   2. KI-Vorschlag holen (Status auf /dev/tty, danach gelöscht)
 #   3. Block-Header MIT Vorschlag anzeigen
 #   4. Aktion wählen
-#   Bei [s]: Name editierbar vorausgefüllt (read -e -i)
+#   Bei [s]: Name editierbar vorausgefüllt (vared — zsh-nativ)
 #            Nach Speichern: "cat <script>  # → zsh zum Ausführen" in History
 # -----------------------------------------------------------------------------
 touch "${PENDING_BLOCKS_FILE}"
@@ -730,7 +730,7 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
           ;;
 
         s|S)
-          # ── Editierbare Namenseingabe (Vorschlag vorausgefüllt, Cursor editierbar)
+          # ── Editierbare Namenseingabe via vared (zsh-nativ, Cursor editierbar)
           ask_edit SNAME "   Name: " "${SUGGESTED}"
           SNAME="${SNAME:-${SUGGESTED}}"
           [[ "${SNAME}" != *.sh ]] && SNAME="${SNAME}.sh"
