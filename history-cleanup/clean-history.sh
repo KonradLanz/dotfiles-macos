@@ -62,7 +62,7 @@ SKIP_EXTRACT=0
 # LM Studio API — Namensvorschlag
 LM_API_URL="http://localhost:1234/v1/chat/completions"
 LM_MODEL=""   # leer = LM Studio wählt aktiv geladenes Modell
-LM_TIMEOUT=8  # Sekunden bis Timeout
+LM_TIMEOUT=15 # Sekunden bis Timeout (lokales Modell braucht manchmal länger)
 
 for arg in "$@"; do
   case "$arg" in
@@ -506,43 +506,48 @@ _derive_script_name() {
 }
 
 # -----------------------------------------------------------------------------
-# LM Studio Namensvorschlag via API
-# Gibt einen einzelnen snake_case-Token zurück, oder leer bei Fehler/Timeout.
-# Wird in Schritt 5 VOR der Block-Anzeige aufgerufen.
+# LM Studio Namensvorschlag via lokale API
+#
+# Status wird direkt auf /dev/tty geschrieben (nicht stderr/stdout)
+# damit er immer sichtbar ist, auch wenn stdout umgeleitet ist.
+# Nach Abschluss wird die Statuszeile mit Leerzeichen überschrieben.
+#
+# Rückgabe: "DATUM_snake_case_name" oder "" bei Fehler/Timeout
+# Fallback: _derive_script_name (lokaler Algorithmus)
 # -----------------------------------------------------------------------------
 _lm_suggest_name() {
   local block="$1"
   local date_prefix=$(date +%Y%m%d)
 
-  # Ersten 800 Zeichen des Blocks als Kontext
-  local snippet
-  snippet=$(printf '%s' "${block}" | head -c 800 | LC_ALL=C sed "s/'/\\\\'/g; s/\"/\\\\\"/g")
+  # Status anzeigen (auf /dev/tty — immer sichtbar)
+  printf '   ⏳ KI-Namensvorschlag wird geholt (max %ds)...' "${LM_TIMEOUT}" > /dev/tty
 
-  # JSON-Body bauen
+  # Ersten 800 Zeichen als Kontext, JSON-Sonderzeichen escapen
+  local snippet
+  snippet=$(printf '%s' "${block}" | head -c 800 \
+    | python3 -c "
+import sys, json
+print(json.dumps(sys.stdin.read())[1:-1])
+" 2>/dev/null) || snippet=""
+
   local payload
-  payload=$(printf '{
-    "model": "%s",
-    "max_tokens": 20,
-    "temperature": 0.1,
-    "messages": [
-      {"role": "system", "content": "You are a script naming assistant. Reply with ONLY a single snake_case filename token (no extension, no explanation, no quotes, 2-5 words max). Date prefix will be added automatically."},
-      {"role": "user", "content": "Name this shell script block:\n\n%s"}
-    ]
-  }' "${LM_MODEL}" "${snippet}")
+  payload=$(printf '{"model":"%s","max_tokens":20,"temperature":0.1,"messages":[{"role":"system","content":"Reply with ONLY a single snake_case filename (no extension, no explanation, 2-5 words). Example: entware_gh_build_deploy"},{"role":"user","content":"Name this shell script:\\n\\n%s"}]}' \
+    "${LM_MODEL}" "${snippet}")
 
   local raw_response
-  raw_response=$(curl -s \
+  raw_response=$(curl -sf \
     --max-time "${LM_TIMEOUT}" \
     -X POST "${LM_API_URL}" \
     -H 'Content-Type: application/json' \
-    -d "${payload}" 2>/dev/null) || true
+    -d "${payload}" 2>/dev/null) || raw_response=""
+
+  # Statuszeile löschen
+  printf '\r%-60s\r' '' > /dev/tty
 
   if [[ -z "${raw_response}" ]]; then
-    echo ""
     return
   fi
 
-  # Ersten Token aus content extrahieren, Backticks/Quotes/Erklärungen wegwerfen
   local name
   name=$(printf '%s' "${raw_response}" \
     | python3 -c "
@@ -550,19 +555,17 @@ import sys, json, re
 try:
     data = json.load(sys.stdin)
     text = data['choices'][0]['message']['content'].strip()
-    # Erstes Wort-Token, Sonderzeichen entfernen
-    token = re.split(r'[\s:,\"\x60]+', text.strip('\"\x60 '))[0]
-    token = re.sub(r'[^a-z0-9_-]', '', token.lower())
-    token = token[:40]
+    # Ersten snake_case Token nehmen, Rest wegwerfen
+    token = re.split(r'[\\s:,\"\x60\\(\\)]+', text.strip('\"\x60 '))[0]
+    token = re.sub(r'[^a-z0-9_-]', '_', token.lower()).strip('_')
+    token = re.sub(r'_+', '_', token)[:40]
     print(token if len(token) >= 3 else '')
 except:
     print('')
-" 2>/dev/null) || true
+" 2>/dev/null) || name=""
 
   if [[ -n "${name}" ]]; then
     echo "${date_prefix}_${name}"
-  else
-    echo ""
   fi
 }
 
@@ -573,7 +576,12 @@ fi
 
 # -----------------------------------------------------------------------------
 # SCHRITT 5 — Interaktive Block-Extraktion
-# LM-Studio-Vorschlag wird VOR der Block-Anzeige geholt → immer sichtbar.
+#
+# Ablauf pro Block:
+#   1. Block einlesen
+#   2. KI-Vorschlag holen (Status auf /dev/tty, danach gelöscht)
+#   3. Block-Header MIT Vorschlag anzeigen
+#   4. Aktion wählen
 # -----------------------------------------------------------------------------
 touch "${PENDING_BLOCKS_FILE}"
 
@@ -591,14 +599,14 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
   ABORT=0
 
   _show_block_lines() {
-    local display="$1" total_lines=$2 idx=$3 total_blocks=$4 from_line=$5 suggested=$6
+    local display="$1" total_lines=$2 idx=$3 total_blocks=$4 from_line=$5 suggested=$6 lm_source=$7
     local show_to=$(( from_line + 10 ))
     [[ ${show_to} -gt ${total_lines} ]] && show_to=${total_lines}
     echo "   +----------------------------------------------------------+"
     printf "   |  Block [%d/%d] — %d Zeilen  (Zeilen %d–%d)\n" \
       ${idx} ${total_blocks} ${total_lines} $(( from_line + 1 )) ${show_to}
     if [[ -n "${suggested}" ]]; then
-      printf "   |  🏷  Vorschlag: %s\n" "${suggested}"
+      printf "   |  🏷  Vorschlag [%s]: %s\n" "${lm_source}" "${suggested}"
     fi
     echo "   +----------------------------------------------------------+"
     printf '%s\n' "${display}" \
@@ -622,22 +630,20 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
 
     BLOCK_IDX=$(( BLOCK_IDX + 1 ))
 
-    # ── LM-Studio-Vorschlag VOR der Anzeige holen ──────────────────────────
-    printf '   ⏳ Hole Namensvorschlag...' >&2
+    # ── KI-Vorschlag holen (Status sichtbar auf /dev/tty) ───────────────────
     LM_SUGGESTED=$(_lm_suggest_name "${BLOCK_DISPLAY}")
-    printf '\r   %-40s\r' '' >&2   # Zeile löschen
-
-    # Fallback auf lokalen Algorithmus wenn LM leer/offline
-    if [[ -z "${LM_SUGGESTED}" ]]; then
-      SUGGESTED=$(_derive_script_name "${BLOCK_RAW}")
-    else
+    if [[ -n "${LM_SUGGESTED}" ]]; then
       SUGGESTED="${LM_SUGGESTED}"
+      LM_SOURCE="KI"
+    else
+      SUGGESTED=$(_derive_script_name "${BLOCK_RAW}")
+      LM_SOURCE="lokal"
     fi
-    # ────────────────────────────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────────────
 
     PREVIEW_FROM=0
     _show_block_lines "${BLOCK_DISPLAY}" ${BLOCK_LINES} \
-      ${BLOCK_IDX} ${BLOCK_COUNT} ${PREVIEW_FROM} "${SUGGESTED}"
+      ${BLOCK_IDX} ${BLOCK_COUNT} ${PREVIEW_FROM} "${SUGGESTED}" "${LM_SOURCE}"
     PREVIEW_FROM=10
     echo ""
 
@@ -653,7 +659,7 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
             echo "   (alle ${BLOCK_LINES} Zeilen gezeigt)"
           else
             _show_block_lines "${BLOCK_DISPLAY}" ${BLOCK_LINES} \
-              ${BLOCK_IDX} ${BLOCK_COUNT} ${PREVIEW_FROM} "${SUGGESTED}"
+              ${BLOCK_IDX} ${BLOCK_COUNT} ${PREVIEW_FROM} "${SUGGESTED}" "${LM_SOURCE}"
             PREVIEW_FROM=$(( PREVIEW_FROM + 10 ))
           fi
           echo ""
