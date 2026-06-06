@@ -177,7 +177,10 @@ _detect_ai_backend() {
 # -----------------------------------------------------------------------------
 # Hilfsfunktion: AI-Namenvorschlag
 # Unterstützt Ollama (/api/generate) und LM Studio (OpenAI /chat/completions).
-# Gibt leeren String zurück bei Fehler → Caller fällt auf Regex-Fallback zurück.
+#
+# Prompt-Design: fordert explizit ein einzelnes snake_case-Wort ohne Erklärung.
+# Parsing: nimmt nur das erste Whitespace-Token, strippt Backticks/Sonderzeichen,
+# sodass auch verbose Modelle ("Here is the name: foo_bar") korrekt geparst werden.
 # -----------------------------------------------------------------------------
 _derive_script_name_ai() {
   local block="$1"
@@ -189,9 +192,26 @@ _derive_script_name_ai() {
   preview=$(printf '%s' "${block}" | head -8 | \
     python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" 2>/dev/null) || return 1
 
-  local sys_prompt="Reply with ONLY a short snake_case filename (max 4 words, no extension, no date prefix, lowercase, underscores only). No explanation."
-  local user_prompt="Script content: ${preview}"
+  # sys_prompt: klar und restriktiv — erstes Token muss der Name sein
+  local sys_prompt="You are a filename generator. Output ONLY a single snake_case identifier (max 4 words joined by underscores, no extension, no date, all lowercase). Nothing else — no explanation, no punctuation, no markdown."
   local name raw_result
+
+  # Gemeinsamer Python-Schnipsel zum robusten Parsen des Modell-Outputs.
+  # Nimmt das erste nicht-leere Token, entfernt Backticks/Sonder­zeichen,
+  # kürzt auf 40 Zeichen.
+  local _parse_name_py
+  _parse_name_py='
+import sys, re
+raw = sys.stdin.read().strip()
+# Backticks, Anführungszeichen, Punkte entfernen
+raw = raw.replace("`", "").replace("\'", "").replace('"', "").replace(".", "_")
+# Erstes Whitespace-Token nehmen (verhindert dass Erklärungen durchkommen)
+token = raw.split()[0] if raw.split() else ""
+# Nur erlaubte Zeichen
+token = re.sub(r"[^a-z0-9_]+", "_", token.lower())
+token = re.sub(r"_+", "_", token).strip("_")
+print(token[:40] if token else "")
+'
 
   if [[ "${_AI_BACKEND}" -eq 1 ]]; then
     # --- Ollama: /api/generate ---
@@ -210,14 +230,12 @@ print(json.dumps({
 " 2>/dev/null)" 2>/dev/null) || return 1
 
     name=$(printf '%s' "${raw_result}" | python3 -c "
-import sys, json, re
+import sys, json
 try:
-    s = json.load(sys.stdin).get('response','').strip()
-    s = re.sub(r'[^a-z0-9_]+', '_', s.lower())
-    s = re.sub(r'_+', '_', s).strip('_')
-    print(s[:40])
+    s = json.load(sys.stdin).get('response', '')
+    sys.stdout.write(s)
 except: pass
-" 2>/dev/null)
+" 2>/dev/null | python3 -c "${_parse_name_py}" 2>/dev/null)
 
   elif [[ "${_AI_BACKEND}" -eq 2 ]]; then
     # --- LM Studio: OpenAI /chat/completions ---
@@ -234,21 +252,19 @@ print(json.dumps({
     {'role': 'system', 'content': '${sys_prompt}'},
     {'role': 'user',   'content': 'Script content: ' + ${preview}}
   ],
-  'max_tokens': 15,
+  'max_tokens': 20,
   'temperature': 0.1,
   'stream': False
 }))
 " 2>/dev/null)" 2>/dev/null) || return 1
 
     name=$(printf '%s' "${raw_result}" | python3 -c "
-import sys, json, re
+import sys, json
 try:
-    s = json.load(sys.stdin)['choices'][0]['message']['content'].strip()
-    s = re.sub(r'[^a-z0-9_]+', '_', s.lower())
-    s = re.sub(r'_+', '_', s).strip('_')
-    print(s[:40])
+    s = json.load(sys.stdin)['choices'][0]['message']['content']
+    sys.stdout.write(s)
 except: pass
-" 2>/dev/null)
+" 2>/dev/null | python3 -c "${_parse_name_py}" 2>/dev/null)
   fi
 
   [[ -n "${name}" ]] && echo "${name}" || return 1
@@ -710,12 +726,14 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
   ABORT=0
 
   _show_block_lines() {
-    local display="$1" total_lines=$2 idx=$3 total_blocks=$4 from_line=$5
+    local display="$1" total_lines=$2 idx=$3 total_blocks=$4 from_line=$5 suggested="$6"
     local show_to=$(( from_line + 10 ))
     [[ ${show_to} -gt ${total_lines} ]] && show_to=${total_lines}
     echo "   +----------------------------------------------------------+"
     printf "   |  Block [%d/%d] — %d Zeilen  (Zeilen %d–%d)\n" \
       ${idx} ${total_blocks} ${total_lines} $(( from_line + 1 )) ${show_to}
+    # Namensvorschlag direkt im Header anzeigen (schon bereit wenn du [s] drückst)
+    [[ -n "${suggested}" ]] && printf "   |  🏷  Vorschlag: %s\n" "${suggested}"
     echo "   +----------------------------------------------------------+"
     printf '%s\n' "${display}" \
       | tail -n +$(( from_line + 1 )) \
@@ -737,11 +755,12 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
       printf '%s\n' "${BLOCK_DISPLAY}" >> "${PENDING_BLOCKS_FILE}" && continue
 
     BLOCK_IDX=$(( BLOCK_IDX + 1 ))
+    # AI-Vorschlag VOR dem Anzeigen berechnen → ist schon im Header sichtbar
     SUGGESTED=$(_derive_script_name "${BLOCK_RAW}")
     PREVIEW_FROM=0
 
     _show_block_lines "${BLOCK_DISPLAY}" ${BLOCK_LINES} \
-      ${BLOCK_IDX} ${BLOCK_COUNT} ${PREVIEW_FROM}
+      ${BLOCK_IDX} ${BLOCK_COUNT} ${PREVIEW_FROM} "${SUGGESTED}"
     PREVIEW_FROM=10
     echo ""
 
@@ -757,7 +776,7 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
             echo "   (alle ${BLOCK_LINES} Zeilen gezeigt)"
           else
             _show_block_lines "${BLOCK_DISPLAY}" ${BLOCK_LINES} \
-              ${BLOCK_IDX} ${BLOCK_COUNT} ${PREVIEW_FROM}
+              ${BLOCK_IDX} ${BLOCK_COUNT} ${PREVIEW_FROM} "${SUGGESTED}"
             PREVIEW_FROM=$(( PREVIEW_FROM + 10 ))
           fi
           echo ""
