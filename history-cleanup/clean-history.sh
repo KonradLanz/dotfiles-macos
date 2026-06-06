@@ -184,6 +184,13 @@ if [[ -n "${CHECKPOINT_DIR}" ]]; then
   else
     echo "   → Checkpoint ignoriert — starte von vorne"
     RESUME_DIR=""
+    # FIX Bug 1: Checkpoint-Variablen zurücksetzen damit beim Neustart
+    # die Zähler nicht aus dem ignorierten Checkpoint übernommen werden.
+    CHECKPOINT_EXTRACTED=0
+    CHECKPOINT_KEPT=0
+    CHECKPOINT_DELETED=0
+    CHECKPOINT_DONE=0
+    CHECKPOINT_REMAINING=0
     echo ""
   fi
 fi
@@ -747,6 +754,11 @@ _script_date() {
 # -----------------------------------------------------------------------------
 touch "${PENDING_BLOCKS_FILE}"
 
+# FIX Bug 2: Gefilterte kurze Blöcke (< MIN_BLOCK_LINES) vor dem aktuellen Block
+# müssen beim Pause-Checkpoint mitgezählt werden. Wir akkumulieren sie in einer
+# separaten Variable und schreiben sie beim [p]-Handler in den Checkpoint.
+_SKIPPED_BLOCKS_RAW=""
+
 if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
   echo ""
   if [[ -z "${RESUME_DIR}" ]]; then
@@ -794,8 +806,13 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
     BLOCK_DISPLAY=$(printf '%s' "${BLOCK_RAW}" | LC_ALL=C sed 's/\\n/\n/g')
     BLOCK_LINES=$(printf '%s' "${BLOCK_DISPLAY}" | wc -l | tr -d ' ')
     BLOCK_LINES=$(( BLOCK_LINES + 1 ))
-    [[ "${BLOCK_LINES}" -lt "${MIN_BLOCK_LINES}" ]] && \
-      printf '%s\n' "${BLOCK_DISPLAY}" >> "${PENDING_BLOCKS_FILE}" && continue
+    if [[ "${BLOCK_LINES}" -lt "${MIN_BLOCK_LINES}" ]]; then
+      # FIX Bug 2: kurze Blöcke akkumulieren — werden beim [p]-Handler
+      # in den Checkpoint geschrieben damit CHECKPOINT_REMAINING stimmt.
+      printf '%s\0' "${BLOCK_RAW}" >> "/tmp/zsh_hist_skipped_${TIMESTAMP}.raw" 2>/dev/null || true
+      printf '%s\n' "${BLOCK_DISPLAY}" >> "${PENDING_BLOCKS_FILE}"
+      continue
+    fi
 
     BLOCK_IDX=$(( BLOCK_IDX + 1 ))
 
@@ -885,8 +902,18 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
           local CP_DIR="${BACKUP_DIR}/checkpoint_${TIMESTAMP}"
           mkdir -p "${CP_DIR}"
 
+          # FIX Bug 2: Zuerst die akkumulierten kurzen (gefilterten) Blöcke
+          # reinschreiben, dann den aktuellen und den Rest — so stimmt
+          # CHECKPOINT_REMAINING mit der tatsächlichen Anzahl überein.
           {
+            # 1. Kurze Blöcke die per continue übersprungen wurden
+            local _skipped_raw="/tmp/zsh_hist_skipped_${TIMESTAMP}.raw"
+            if [[ -f "${_skipped_raw}" ]]; then
+              cat "${_skipped_raw}"
+            fi
+            # 2. Aktueller Block (noch nicht entschieden)
             printf '%s\0' "${BLOCK_RAW}"
+            # 3. Rest aus dem fd
             while IFS= read -r -d $'\0' _REST_RAW <&3; do
               [[ -z "${_REST_RAW// }" ]] && continue
               printf '%s\0' "${_REST_RAW}"
@@ -903,6 +930,10 @@ data = open('${CP_DIR}/blocks.raw', 'rb').read()
 print(len([b for b in data.split(b'\x00') if b.strip()]))
 " 2>/dev/null || echo 0)
 
+          # FIX Bug 1: CHECKPOINT_DONE zählt nur entschiedene Blöcke
+          # (BLOCK_IDX - 1), also ohne den aktuellen der noch nicht
+          # entschieden ist. EXTRACTED_COUNT / KEPT_COUNT / DELETED_COUNT
+          # sind die echten Zähler aus dieser Session (ohne Checkpoint-Rest).
           cat > "${CP_DIR}/meta.env" << METAEOF
 CHECKPOINT_DATE="$(date '+%Y-%m-%d %H:%M:%S')"
 CHECKPOINT_DONE=$(( BLOCK_IDX - 1 ))
@@ -959,6 +990,9 @@ METAEOF
 
   exec 3<&-
   set -e
+
+  # Temporäre Datei für gefilterte kurze Blöcke aufräumen
+  rm -f "/tmp/zsh_hist_skipped_${TIMESTAMP}.raw" 2>/dev/null || true
 
   if [[ ${ABORT} -eq 2 ]]; then
     echo ""
