@@ -334,8 +334,9 @@ else
   echo "   ℹ️  ${HISTFILE} existiert noch nicht"
 fi
 
+# FIX: Session-Backups nur anlegen wenn die Datei nicht leer ist (-s)
 for f in ~/.zsh_sessions/*.history(N) ~/.zsh_sessions/*.historynew(N); do
-  [[ -f "$f" ]] && cp "$f" "${BACKUP_DIR}/$(basename $f).${TIMESTAMP}.bak"
+  [[ -f "$f" && -s "$f" ]] && cp "$f" "${BACKUP_DIR}/$(basename $f).${TIMESTAMP}.bak"
 done
 
 echo "   → Merge..."
@@ -1059,11 +1060,14 @@ LC_ALL=C awk \
   }
   ' "${SINGLES_FILE}" > "${CLEAN_FILE}"
 
+# FIX: leere longlines-Backup-Datei löschen falls awk nichts reingeschrieben hat
 LONGLINES_COUNT=0
-[[ -f "${LONGLINES_BACKUP}" ]] && LONGLINES_COUNT=$(wc -l < "${LONGLINES_BACKUP}" | tr -d ' ')
-if [[ "${LONGLINES_COUNT}" -gt 0 ]]; then
+if [[ -s "${LONGLINES_BACKUP}" ]]; then
+  LONGLINES_COUNT=$(wc -l < "${LONGLINES_BACKUP}" | tr -d ' ')
   echo "   ℹ️  ${LONGLINES_COUNT} sehr lange Zeilen (> ${MAX_LINE_LEN} Zeichen) gesichert:"
   echo "      → ${LONGLINES_BACKUP}"
+else
+  rm -f "${LONGLINES_BACKUP}" 2>/dev/null || true
 fi
 
 if [[ -s "${ENTRIES_TO_DELETE}" ]]; then
@@ -1104,6 +1108,18 @@ else
 
   cp "${CLEAN_FILE}" "${HISTFILE}"
   echo "   ✓ ${HISTFILE} aktualisiert (${CLEAN_COUNT} Einträge)"
+
+  # FIX: Backup-Duplikate entfernen falls rdfind verfügbar
+  if command -v rdfind > /dev/null 2>&1; then
+    echo ""
+    echo "   🔍 rdfind — Backup-Duplikate entfernen..."
+    _RDFIND_OUT=$(rdfind -deleteduplicates true "${BACKUP_DIR}" 2>&1)
+    _DELETED_DUPS=$(printf '%s' "${_RDFIND_OUT}" | grep 'Now deleting' | grep -Eo '[0-9]+' | tail -1)
+    [[ -n "${_DELETED_DUPS}" && "${_DELETED_DUPS}" -gt 0 ]] \
+      && echo "   ✓ rdfind: ${_DELETED_DUPS} doppelte Backup(s) gelöscht" \
+      || echo "   ✓ rdfind: keine Duplikate gefunden"
+    rm -f "${BACKUP_DIR}/results.txt" 2>/dev/null || true
+  fi
 fi
 
 # trap EXIT übernimmt das Cleanup aller /tmp-Dateien
