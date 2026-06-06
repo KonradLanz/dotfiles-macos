@@ -45,7 +45,7 @@ set -eo pipefail
 # --- Config ---
 HISTFILE="${_HISTFILE}"
 BACKUP_DIR="${HOME}/.zsh_history_backups"
-SCRIPTS_DIR="${HOME}/scripts"
+SCRIPTS_DIR="${HOME}/scripts"   # ~ funktioniert hier nicht zuverlässig in Strings
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 MERGED_DUMP="/tmp/zsh_hist_merged_${TIMESTAMP}.txt"
 BLOCKS_RAW="/tmp/zsh_hist_blocks_${TIMESTAMP}.raw"
@@ -103,12 +103,9 @@ ask() {
 # zeigt nur den editierbaren Inhalt.
 ask_edit() {
   local _var="$1" _prompt="$2" _default="$3"
-  # Lokale Kopie des Defaultwertes — vared editiert die Variable in-place
   local _reply="${_default}"
   printf '%s' "${_prompt}" > /dev/tty
-  # vared liest von /dev/tty und schreibt das Ergebnis direkt in _reply
   vared -p '' _reply < /dev/tty > /dev/tty 2>/dev/null
-  # Falls vared fehlschlug oder leer: Fallback auf Default
   typeset -g "${_var}"="${_reply:-${_default}}"
 }
 
@@ -521,17 +518,16 @@ fi
 _derive_script_name() {
   local block="$1" date_prefix=$(date +%Y%m%d) name="" repo=""
 
-  # Repo-Name aus Block extrahieren (github.com/X/REPO, cd .../REPO, git clone)
   repo=$(printf '%s' "${block}" | LC_ALL=C sed 's/\\n/\n/g' \
     | LC_ALL=C grep -Eo '(github\.com/[^/]+/([^/" ]+)|cd[[:space:]]+[^/]*/([-a-z0-9_]+)|git[[:space:]]+clone[[:space:]]+[^/]+/([-a-z0-9_]+))' \
     | LC_ALL=C sed 's|.*/\([-a-z0-9_]*\)$|\1|' \
-    | head -1 | tr -cd 'a-z0-9-' | cut -c1-20)
+    | head -1 | tr -cd 'a-z0-9-' | cut -c1-30)
 
   name=$(printf '%s' "${block}" | LC_ALL=C sed 's/\\n/\n/g' | grep '^#' | head -1 \
-    | sed 's/^#[[:space:]]*//' | tr ' ' '_' | tr -cd 'a-z0-9_-' | cut -c1-30)
+    | sed 's/^#[[:space:]]*//' | tr ' ' '_' | tr -cd 'a-z0-9_-' | cut -c1-50)
   if [[ -z "${name}" ]]; then
     name=$(printf '%s' "${block}" | LC_ALL=C sed 's/\\n/\n/g' | grep -v '^#' | head -1 \
-      | awk '{print $1}' | tr -cd 'a-z0-9_-' | cut -c1-20)
+      | awk '{print $1}' | tr -cd 'a-z0-9_-' | cut -c1-30)
   fi
   [[ -z "${name}" ]] && name="script"
 
@@ -547,22 +543,20 @@ _derive_script_name() {
 #
 # - Wird NACH der Block-Anzeige aufgerufen (parallel lesbar)
 # - Status auf /dev/tty (immer sichtbar, wird danach gelöscht)
+# - Längere, präzisere Namen erlaubt (bis 80 Zeichen nach Datumspräfix)
 # - Fallback: _derive_script_name
 # -----------------------------------------------------------------------------
 _lm_suggest_name() {
   local block="$1"
   local date_prefix=$(date +%Y%m%d)
 
-  # Status anzeigen (auf /dev/tty — immer sichtbar)
   printf '   ⏳ KI-Namensvorschlag wird geholt (max %ds)...' "${LM_TIMEOUT}" > /dev/tty
 
-  # Repo-Namen aus Block extrahieren
   local repo_hint
   repo_hint=$(printf '%s' "${block}" \
     | LC_ALL=C grep -Eo '(github\.com/[^/]+/[^/" ]+|entware-packages|entware-work|dotfiles[-a-z]*|[-a-z0-9]+\.git)' \
     | LC_ALL=C sed 's|\.git$||' | sort -u | head -3 | tr '\n' ' ' | xargs)
 
-  # Persönlichen Kontext zusammenbauen
   local user_ctx=""
   [[ -n "${LM_USER_CONTEXT_NAME}"   ]] && user_ctx+="User: ${LM_USER_CONTEXT_NAME}. "
   [[ -n "${LM_USER_CONTEXT_EMAIL}"  ]] && user_ctx+="Email: ${LM_USER_CONTEXT_EMAIL}. "
@@ -570,16 +564,15 @@ _lm_suggest_name() {
   [[ -n "${LM_USER_CONTEXT_EXTRA}"  ]] && user_ctx+="${LM_USER_CONTEXT_EXTRA}. "
   [[ -n "${repo_hint}"              ]] && user_ctx+="Repos mentioned: ${repo_hint}. "
 
-  # System-Prompt mit Kontext
   local sys_prompt
   sys_prompt=$(printf '%s' \
-    "Reply with ONLY a single snake_case filename token (no extension, no explanation, 2-6 words max). " \
-    "If a repo name is clearly mentioned in the script, include it in the name. " \
-    "If a personal identifier (email domain, username) appears, include a short form. " \
-    "Example: entware_packages_gh_build, greev_ssh_key_setup, dotfiles_git_sync. " \
+    "Reply with ONLY a single snake_case filename token (no extension, no explanation). " \
+    "Use 3-8 descriptive words that precisely capture what the script does. " \
+    "Prefer longer, more specific names over short vague ones. " \
+    "Always include the repo/tool name if clearly present. " \
+    "Examples: entware_packages_gh_cli_build_and_deploy_qnap, greev_ssh_ed25519_key_setup, dotfiles_macos_git_sync_pull. " \
     "${user_ctx}")
 
-  # JSON escapen
   local snippet sys_json
   snippet=$(printf '%s' "${block}" | head -c 800 \
     | python3 -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])" 2>/dev/null) || snippet=""
@@ -587,7 +580,7 @@ _lm_suggest_name() {
     | python3 -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])" 2>/dev/null) || sys_json=""
 
   local payload
-  payload=$(printf '{"model":"%s","max_tokens":25,"temperature":0.1,"messages":[{"role":"system","content":"%s"},{"role":"user","content":"Name this shell script:\\n\\n%s"}]}' \
+  payload=$(printf '{"model":"%s","max_tokens":40,"temperature":0.1,"messages":[{"role":"system","content":"%s"},{"role":"user","content":"Name this shell script:\\n\\n%s"}]}' \
     "${LM_MODEL}" "${sys_json}" "${snippet}")
 
   local raw_response
@@ -597,7 +590,6 @@ _lm_suggest_name() {
     -H 'Content-Type: application/json' \
     -d "${payload}" 2>/dev/null) || raw_response=""
 
-  # Statuszeile löschen
   printf '\r%-60s\r' '' > /dev/tty
 
   [[ -z "${raw_response}" ]] && return
@@ -611,7 +603,7 @@ try:
     text = data['choices'][0]['message']['content'].strip()
     token = re.split(r'[\s:,\"\`\(\)]+', text.strip('\"\` '))[0]
     token = re.sub(r'[^a-z0-9_-]', '_', token.lower()).strip('_')
-    token = re.sub(r'_+', '_', token)[:50]
+    token = re.sub(r'_+', '_', token)[:80]
     print(token if len(token) >= 3 else '')
 except:
     print('')
@@ -622,16 +614,17 @@ except:
 
 mkdir -p "${SCRIPTS_DIR}"
 if [[ ! -d "${SCRIPTS_DIR}/.git" ]]; then
-  git -C "${SCRIPTS_DIR}" init -b main --quiet 2>/dev/null || git -C "${SCRIPTS_DIR}" init --quiet
+  git -C "${SCRIPTS_DIR}" init -b main --quiet > /dev/null 2>&1 \
+    || git -C "${SCRIPTS_DIR}" init --quiet > /dev/null 2>&1
 fi
 
 # -----------------------------------------------------------------------------
 # SCHRITT 5 — Interaktive Block-Extraktion
 #
 # Ablauf pro Block:
-#   1. Block sofort anzeigen (ohne KI-Vorschlag — Platzhalter "…")
+#   1. Block sofort anzeigen (ohne KI-Vorschlag — Platzhalter "wird geholt...")
 #   2. KI-Vorschlag holen WÄHREND der User liest (Status auf /dev/tty)
-#   3. Vorschlag inline aktualisieren (eine Zeile überschreiben)
+#   3. Vorschlag nachträglich anzeigen (eine Zeile)
 #   4. Aktion wählen
 #   Bei [s]: Name editierbar vorausgefüllt (vared — zsh-nativ)
 #            Nach Speichern: "cat <script>  # → zsh zum Ausführen" in History
@@ -702,7 +695,7 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
       LM_SOURCE="lokal"
     fi
 
-    # ── 3. Vorschlag nachträglich anzeigen (eine Zeile) ────────────────────
+    # ── 3. Vorschlag nachträglich anzeigen ──────────────────────────────
     printf "   🏷  Vorschlag [%s]: %s\n\n" "${LM_SOURCE}" "${SUGGESTED}" > /dev/tty
 
     while true; do
@@ -734,7 +727,6 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
           ;;
 
         s|S)
-          # ── Editierbare Namenseingabe via vared (zsh-nativ, Cursor editierbar)
           ask_edit SNAME "   Name: " "${SUGGESTED}"
           SNAME="${SNAME:-${SUGGESTED}}"
           [[ "${SNAME}" != *.sh ]] && SNAME="${SNAME}.sh"
@@ -747,11 +739,9 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
             printf '#!/usr/bin/env zsh\n# Extracted: %s\n# From: zsh history cleanup\n# ---\n\n%s\n' \
               "$(date '+%Y-%m-%d %H:%M')" "${BLOCK_DISPLAY}" > "${SPATH}"
             chmod +x "${SPATH}"
-            git -C "${SCRIPTS_DIR}" add "${SNAME}" 2>/dev/null || true
-            git -C "${SCRIPTS_DIR}" commit -m "extract: ${SNAME}" --quiet 2>/dev/null || true
+            git -C "${SCRIPTS_DIR}" add "${SNAME}" > /dev/null 2>&1 || true
+            git -C "${SCRIPTS_DIR}" commit -m "extract: ${SNAME}" --quiet > /dev/null 2>&1 || true
             echo "   ✓ Gespeichert: ${SPATH}"
-            # cat-Aufruf in die zsh-History schreiben
-            # (Hinweis-Kommentar: cat → zsh tauschen um auszuführen)
             print -s "cat ${SPATH}  # → zsh ${SPATH} zum Ausführen"
             echo "   ✓ History: cat ${SPATH}  # → zsh ${SPATH} zum Ausführen"
           fi
