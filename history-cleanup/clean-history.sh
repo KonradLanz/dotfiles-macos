@@ -26,7 +26,7 @@
 _SCRIPT_DIR="${${(%):-%x}:A:h}"
 if [[ -d "${_SCRIPT_DIR}/../.git" ]]; then
   echo "🔄 Schritt 0 — Auto-Pull..."
-  _PULL_OUT=$(git -C "${_SCRIPT_DIR}/..\" pull --ff-only 2>&1)
+  _PULL_OUT=$(git -C "${_SCRIPT_DIR}/.." pull --ff-only 2>&1)
   _PULL_RC=$?
   if [[ ${_PULL_RC} -eq 0 ]]; then
     echo "   ${_PULL_OUT}"
@@ -56,6 +56,8 @@ PENDING_BLOCKS_FILE="/tmp/zsh_hist_pending_${TIMESTAMP}.txt"
 MIN_BLOCK_LINES=3
 LONG_THRESH=200    # Einzelzeilen >= dieser Zeichenanzahl → Schritt 5 Block-Review
 MAX_LINE_LEN=500   # Einzelzeilen (non-backslash) > dieser Zeichenanzahl → in Backup sichern + entfernen
+OLLAMA_BASE_URL="http://localhost:11434"  # local-ai-stack Ollama endpoint
+OLLAMA_MODEL="llama3.1:8b"               # Modell aus local-ai-stack .env.example
 DRY_RUN=0
 SKIP_EXTRACT=0
 
@@ -82,6 +84,138 @@ ask() {
   IFS= read -r "_reply?${_prompt}" < /dev/tty
   typeset -g "${_var}"="${_reply}"
 }
+
+# -----------------------------------------------------------------------------
+# Hilfsfunktion: Ollama-Verfügbarkeit prüfen (kein Start, nur Check)
+# Gibt 0 zurück wenn Ollama antwortet, 1 sonst.
+# -----------------------------------------------------------------------------
+_ollama_available() {
+  curl -sf --max-time 2 "${OLLAMA_BASE_URL}/api/tags" >/dev/null 2>&1
+}
+
+# -----------------------------------------------------------------------------
+# Hilfsfunktion: AI-Namenvorschlag via Ollama (local-ai-stack)
+#
+# Prüft ob Ollama läuft. Falls nicht → versucht einmalig `ollama serve`
+# im Hintergrund zu starten und wartet max. 5s.
+# Bei Erfolg: liefert einen snake_case-Dateinamen (ohne Datum, ohne .sh).
+# Bei Fehler/Timeout: gibt leeren String zurück → Caller fällt auf
+# _derive_script_name_fallback() zurück.
+# -----------------------------------------------------------------------------
+_OLLAMA_CHECKED=0   # 0 = noch nicht geprüft, 1 = verfügbar, 2 = nicht verfügbar
+
+_derive_script_name_ai() {
+  local block="$1"
+
+  # Ollama-Status gecacht damit wir nicht bei jedem Block neu prüfen
+  if [[ "${_OLLAMA_CHECKED}" -eq 0 ]]; then
+    if _ollama_available; then
+      _OLLAMA_CHECKED=1
+      echo "   🤖 Ollama verfügbar — AI-Namenvorschläge aktiv (${OLLAMA_MODEL})" >&2
+    else
+      # Einmalig versuchen zu starten
+      echo "   🤖 Ollama nicht aktiv — versuche zu starten..." >&2
+      ollama serve >/dev/null 2>&1 &
+      local waited=0
+      while [[ ${waited} -lt 5 ]]; do
+        sleep 1; waited=$(( waited + 1 ))
+        _ollama_available && break
+      done
+      if _ollama_available; then
+        _OLLAMA_CHECKED=1
+        echo "   🤖 Ollama gestartet — AI-Namenvorschläge aktiv (${OLLAMA_MODEL})" >&2
+      else
+        _OLLAMA_CHECKED=2
+        echo "   ⚠️  Ollama nicht erreichbar — Fallback auf Regex-Namen" >&2
+      fi
+    fi
+  fi
+
+  [[ "${_OLLAMA_CHECKED}" -ne 1 ]] && return 1
+
+  # Ersten 8 Zeilen des Blocks als Kontext (Sonderzeichen escapen)
+  local preview
+  preview=$(printf '%s' "${block}" | head -8 | \
+    python3 -c "
+import sys, json
+lines = sys.stdin.read()
+print(json.dumps(lines))
+" 2>/dev/null) || return 1
+
+  local prompt="Reply with ONLY a short snake_case filename (max 4 words, no extension, no date prefix, lowercase, underscores only). No explanation. Script content:\n${preview}"
+
+  local raw_result
+  raw_result=$(curl -sf --max-time 8 \
+    "${OLLAMA_BASE_URL}/api/generate" \
+    -H 'Content-Type: application/json' \
+    -d "$(python3 -c "
+import json, sys
+print(json.dumps({
+  'model': '${OLLAMA_MODEL}',
+  'prompt': ${prompt},
+  'stream': False,
+  'options': {'num_predict': 15, 'temperature': 0.1}
+}))
+" 2>/dev/null)" 2>/dev/null) || return 1
+
+  local name
+  name=$(printf '%s' "${raw_result}" | \
+    python3 -c "
+import sys, json, re
+try:
+    d = json.load(sys.stdin)
+    s = d.get('response','').strip()
+    # Nur den ersten Token nehmen, alles bereinigen
+    s = re.sub(r'[^a-z0-9_]+', '_', s.lower())
+    s = re.sub(r'_+', '_', s).strip('_')
+    print(s[:40])
+except: pass
+" 2>/dev/null)
+
+  [[ -n "${name}" ]] && echo "${name}" || return 1
+}
+
+# -----------------------------------------------------------------------------
+# Hilfsfunktion: Regex-Fallback für Script-Name (bisherige Logik, acook-Bug gefixt)
+# Fix: tr '[:upper:]' '[:lower:]' VOR tr -cd damit Grossbuchstaben nicht einfach
+# wegfallen ("MacBook" → "macbook" statt "acook").
+# -----------------------------------------------------------------------------
+_derive_script_name_fallback() {
+  local block="$1" date_prefix=$(date +%Y%m%d) name=""
+  # Kommentarzeile als Quelle: Grossbuchstaben → Klein, dann filtern
+  name=$(echo "${block}" | LC_ALL=C sed 's/\\n/\n/g' | grep '^#' | head -1 \
+    | sed 's/^#[[:space:]]*//' \
+    | tr '[:upper:]' '[:lower:]' \
+    | tr ' ' '-' \
+    | tr -cd 'a-z0-9-' \
+    | sed 's/-\{2,\}/-/g' \
+    | cut -c1-30)
+  # Fallback: erster Befehl
+  if [[ -z "${name}" ]]; then
+    name=$(echo "${block}" | LC_ALL=C sed 's/\\n/\n/g' | grep -v '^#' | head -1 \
+      | awk '{print $1}' \
+      | tr '[:upper:]' '[:lower:]' \
+      | tr -cd 'a-z0-9_-' \
+      | cut -c1-20)
+  fi
+  [[ -z "${name}" ]] && name="script"
+  echo "${date_prefix}_${name}"
+}
+
+# -----------------------------------------------------------------------------
+# Hilfsfunktion: Script-Name ableiten (AI → Fallback)
+# -----------------------------------------------------------------------------
+_derive_script_name() {
+  local block="$1" date_prefix=$(date +%Y%m%d) ai_name
+  ai_name=$(_derive_script_name_ai "${block}" 2>/dev/null) && \
+    echo "${date_prefix}_${ai_name}" || \
+    _derive_script_name_fallback "${block}"
+}
+
+mkdir -p "${SCRIPTS_DIR}"
+if [[ ! -d "${SCRIPTS_DIR}/.git" ]]; then
+  git -C "${SCRIPTS_DIR}" init -b main --quiet 2>/dev/null || git -C "${SCRIPTS_DIR}" init --quiet
+fi
 
 # -----------------------------------------------------------------------------
 # SCHRITT 1 — Terminal-Sessions analysieren
@@ -224,25 +358,10 @@ echo "   ✓ UTF-8 bereinigt"
 
 # -----------------------------------------------------------------------------
 # SCHRITT 2a — History-Format erkennen
-#
-# EXTENDED: Einträge beginnen mit ": TIMESTAMP:ELAPSED;"
-#           Multiline-Blöcke sind \n-kodiert auf einer Zeile
-#           Beispiel: ": 1717000000:0;cd ~/foo\ngit pull"
-#
-# SIMPLE:   Keine Timestamps. Multiline über echte Zeilenumbrüche,
-#           Continuation-Zeilen enden auf \
-#           Beispiel: "cd ~/foo\"  (Zeile 1)
-#                     "git pull"  (Zeile 2)
-#
-# Entscheidung: >= 10% der Zeilen starten mit ": [0-9]+:[0-9]+;" → EXTENDED
 # -----------------------------------------------------------------------------
 echo "   → History-Format erkennen..."
 
 TOTAL_LINES="${MERGED_COUNT}"
-
-# grep -c gibt auf macOS bei 0 Treffern exit 1 zurück — || true verhindert
-# Script-Abbruch (set -e). tr -d ' \n' entfernt führende Leerzeichen und
-# eventuelle Newlines die grep -c liefern kann.
 EXTENDED_LINES=$(LC_ALL=C grep -c '^: [0-9][0-9]*:[0-9][0-9]*;' "${MERGED_DUMP}" 2>/dev/null || true)
 EXTENDED_LINES=$(printf '%s' "${EXTENDED_LINES}" | tr -d ' \n\r\t')
 [[ -z "${EXTENDED_LINES}" || "${EXTENDED_LINES}" == *[!0-9]* ]] && EXTENDED_LINES=0
@@ -264,25 +383,12 @@ fi
 
 # -----------------------------------------------------------------------------
 # SCHRITT 2b — Block-Erkennung + Dedup
-#
-# EXTENDED-Modus:
-#   Quelle 1: Zeilen mit \n\n (echter Mehrzeiler, \n-kodiert)
-#   Quelle 2: Superlange Einzelzeilen (>= LONG_THRESH Zeichen)
-#
-# SIMPLE-Modus:
-#   Python liest den gesamten Dump und gruppiert:
-#     - Aufeinanderfolgende Zeilen die auf \ enden → Backslash-Continuation-Block
-#     - Einzelzeilen >= LONG_THRESH Zeichen → langer Einzelbefehl (Review)
-#   Einzelzeilen < LONG_THRESH landen direkt in SINGLES_FILE.
-#
-# Alle Blöcke → BLOCKS_RAW (NUL-separiert), dann Python-Dedup.
 # -----------------------------------------------------------------------------
 echo "   → Blöcke erkennen (>= ${MIN_BLOCK_LINES} Zeilen, oder >= ${LONG_THRESH} Zeichen)..."
 
 touch "${BLOCKS_RAW}.raw0"
 
 if [[ "${HIST_FORMAT}" == "EXTENDED" ]]; then
-  # Quelle 1: echte Mehrzeiler (\n-kodiert, mind. 2x \n im String)
   LC_ALL=C grep '\\n.*\\n' "${MERGED_DUMP}" \
     | LC_ALL=C sed \
         -e 's/^[[:space:]]*[0-9]*[[:space:]]*//' \
@@ -291,7 +397,6 @@ if [[ "${HIST_FORMAT}" == "EXTENDED" ]]; then
     | LC_ALL=C tr '\n' '\0' \
     >> "${BLOCKS_RAW}.raw0" 2>/dev/null || true
 
-  # Quelle 2: superlange Einzelzeilen (kein \n, aber >= LONG_THRESH Zeichen)
   LC_ALL=C grep -v '\\n.*\\n' "${MERGED_DUMP}" \
     | LC_ALL=C awk -v thresh="${LONG_THRESH}" 'length >= thresh' \
     | LC_ALL=C sed \
@@ -301,23 +406,19 @@ if [[ "${HIST_FORMAT}" == "EXTENDED" ]]; then
     >> "${BLOCKS_RAW}.raw0" 2>/dev/null || true
 
 else
-  # SIMPLE-Format: Python gruppiert Backslash-Continuation-Blöcke
-  # und schreibt Einzelzeilen direkt in SINGLES_FILE
   export _MERGED_IN="${MERGED_DUMP}"
   export _BLOCKS_OUT="${BLOCKS_RAW}.raw0"
   export _SINGLES_OUT="${SINGLES_FILE}"
   export _LONG_THRESH="${LONG_THRESH}"
 
   python3 << 'PYEOF_SIMPLE'
-import os, sys
+import os, sys, re
 
 merged_in   = os.environ['_MERGED_IN']
 blocks_out  = os.environ['_BLOCKS_OUT']
 singles_out = os.environ['_SINGLES_OUT']
 long_thresh = int(os.environ['_LONG_THRESH'])
 
-# Normalisierungs-Hilfsfunktion: führende Zeilennummern / Timestamp-Präfixe entfernen
-import re
 def strip_prefix(line):
     line = re.sub(r'^: \d+:\d+;', '', line)
     line = re.sub(r'^\s*\d+\s+', '', line)
@@ -325,11 +426,11 @@ def strip_prefix(line):
 
 try:
     raw_lines = open(merged_in, encoding='utf-8', errors='replace').readlines()
-except Exception as e:
+except Exception:
     sys.exit(0)
 
-blocks  = []   # Liste von Strings (mehrzeilige Blöcke, NUL-getrennt)
-singles = []   # Einzelzeilen
+blocks  = []
+singles = []
 
 i = 0
 while i < len(raw_lines):
@@ -337,7 +438,6 @@ while i < len(raw_lines):
     stripped = strip_prefix(line)
 
     if stripped.endswith('\\'):
-        # Backslash-Continuation: sammle alle folgenden Zeilen
         block_lines = [stripped]
         i += 1
         while i < len(raw_lines):
@@ -349,19 +449,16 @@ while i < len(raw_lines):
                 break
         blocks.append('\n'.join(block_lines))
     else:
-        # Einzelzeile
         if stripped and len(stripped) >= long_thresh:
-            blocks.append(stripped)   # lange Einzelzeile → Review in Schritt 5
+            blocks.append(stripped)
         elif stripped:
             singles.append(stripped)
         i += 1
 
-# Blöcke NUL-separiert schreiben
 with open(blocks_out, 'ab') as f:
     for b in blocks:
         f.write(b.encode('utf-8', errors='replace') + b'\x00')
 
-# Einzelzeilen schreiben (append, da Datei möglicherweise schon existiert)
 with open(singles_out, 'a', encoding='utf-8', errors='replace') as f:
     for s in singles:
         f.write(s + '\n')
@@ -370,7 +467,6 @@ PYEOF_SIMPLE
   unset _MERGED_IN _BLOCKS_OUT _SINGLES_OUT _LONG_THRESH
 fi
 
-# Python-Dedup über alle Blöcke (format-unabhängig)
 export _BLOCKS_RAW_IN="${BLOCKS_RAW}.raw0"
 export _BLOCKS_RAW_OUT="${BLOCKS_RAW}"
 BLOCK_COUNT=$(python3 << 'PYEOF_DEDUP'
@@ -378,17 +474,14 @@ import re, os, sys
 
 try:
     data = open(os.environ['_BLOCKS_RAW_IN'], 'rb').read()
-except Exception as e:
-    print(0, file=sys.stderr)
+except Exception:
     print(0)
     raise SystemExit
 
 raw_blocks = [b for b in data.split(b'\x00') if b.strip()]
-
 seen = set()
 uniq = []
 for b in raw_blocks:
-    # Normalisierungsschlüssel: \n-Escape expandieren, Leerzeilen + Whitespace strippen
     key = re.sub(rb'\\n', b'\n', b)
     key = b'\n'.join(ln.strip() for ln in key.splitlines() if ln.strip())
     if key in seen:
@@ -410,8 +503,6 @@ echo "   ✓ Blöcke nach Dedup: ${BLOCK_COUNT}"
 
 # -----------------------------------------------------------------------------
 # SCHRITT 2c — Normalisierung Einzelzeilen (nur EXTENDED-Modus)
-# Im SIMPLE-Modus hat Python die Einzelzeilen bereits in SINGLES_FILE geschrieben.
-# Im EXTENDED-Modus lesen wir sie hier aus dem Dump.
 # -----------------------------------------------------------------------------
 if [[ "${HIST_FORMAT}" == "EXTENDED" ]]; then
   echo "   → Normalisierung Einzelzeilen (EXTENDED)..."
@@ -526,29 +617,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# SCHRITT 4 — Script-Name ableiten
-# -----------------------------------------------------------------------------
-_derive_script_name() {
-  local block="$1" date_prefix=$(date +%Y%m%d) name=""
-  name=$(echo "${block}" | LC_ALL=C sed 's/\\n/\n/g' | grep '^#' | head -1 \
-    | sed 's/^#[[:space:]]*//' | tr ' ' '-' | tr -cd 'a-z0-9-' | cut -c1-30)
-  if [[ -z "${name}" ]]; then
-    name=$(echo "${block}" | LC_ALL=C sed 's/\\n/\n/g' | grep -v '^#' | head -1 \
-      | awk '{print $1}' | tr -cd 'a-z0-9_-' | cut -c1-20)
-  fi
-  [[ -z "${name}" ]] && name="script"
-  echo "${date_prefix}_${name}"
-}
-
-mkdir -p "${SCRIPTS_DIR}"
-if [[ ! -d "${SCRIPTS_DIR}/.git" ]]; then
-  git -C "${SCRIPTS_DIR}" init -b main --quiet 2>/dev/null || git -C "${SCRIPTS_DIR}" init --quiet
-fi
-
-# -----------------------------------------------------------------------------
 # SCHRITT 5 — Interaktive Block-Extraktion
-# Nicht entschiedene Blöcke → PENDING_BLOCKS_FILE → kommen in History.
-# [M] less: tmp-Datei über /dev/tty als Vordergrundprozess.
 # -----------------------------------------------------------------------------
 touch "${PENDING_BLOCKS_FILE}"
 
@@ -710,18 +779,6 @@ fi
 
 # -----------------------------------------------------------------------------
 # SCHRITT 6 — Dedup + Secret-Entfernung + sehr lange Zeilen sichern & entfernen
-#
-# Dedup-Regel:
-#   - Zeilen, die auf \ enden (Continuation-Zeilen in Mehrzeilern),
-#     werden NICHT dedupliziert — sie bleiben immer erhalten.
-#   - Alle anderen Zeilen werden normal dedupliziert (!seen[$0]++).
-#
-# Sehr-lang-Regel (non-backslash-Zeilen > MAX_LINE_LEN Zeichen):
-#   - Diese Zeilen werden in eine Backup-Datei im BACKUP_DIR gesichert
-#     (zsh_hist_longlines.TIMESTAMP.txt) und dann aus der History entfernt.
-#   - Zeilen, die auf \ enden, sind immer geschützt.
-#
-# SINGLES_FILE + PENDING_BLOCKS_FILE → CLEAN_FILE
 # -----------------------------------------------------------------------------
 echo ""
 echo "🧹 SCHRITT 6 — History bereinigen"
@@ -738,23 +795,16 @@ touch "${ENTRIES_TO_DELETE}"
 [[ "${REMOVE_SECRETS}" == "J" ]] && \
   LC_ALL=C grep '^\[.*\] ' "${SECRET_FILE}" | LC_ALL=C sed 's/^\[.*\] //' >> "${ENTRIES_TO_DELETE}"
 
-# Dedup + Längen-Filter in einem awk-Durchlauf:
-#   \-Zeilen    → immer durchlassen (kein Dedup, kein Längen-Filter)
-#   Leerzeilen  → überspringen
-#   > MAX_LINE_LEN (non-\) → in Backup-Datei schreiben, aus History entfernen
-#   Rest        → normal deduplizieren
 LC_ALL=C awk \
   -v maxlen="${MAX_LINE_LEN}" \
   -v longbak="${LONGLINES_BACKUP}" \
   '
   /^[[:space:]]*$/ { next }
   /\\$/ {
-    # Continuation-Zeile: immer behalten, nie deduplizieren
     print
     next
   }
   length > maxlen {
-    # Sehr lange Non-Continuation-Zeile: in Backup sichern, aus History entfernen
     print > longbak
     next
   }
