@@ -51,6 +51,7 @@ SECRET_FILE="/tmp/zsh_hist_secrets_${TIMESTAMP}.txt"
 PENDING_BLOCKS_FILE="/tmp/zsh_hist_pending_${TIMESTAMP}.txt"
 MIN_BLOCK_LINES=3
 LONG_THRESH=200    # Einzelzeilen >= dieser Zeichenanzahl → Schritt 5 Block-Review
+MAX_LINE_LEN=500   # Einzelzeilen (non-backslash) > dieser Zeichenanzahl → in Backup sichern + entfernen
 DRY_RUN=0
 SKIP_EXTRACT=0
 
@@ -352,7 +353,7 @@ SECRET_PATTERNS = [
 FALSE_POSITIVE_PATTERNS = [
     r'^ssh\s+',
     r'^scp\s+',
-    r'^\\.zsh_sessions/',
+    r'^\.zsh_sessions/',
     r'historynew$',
 ]
 TOKEN_WHITELIST = [
@@ -582,8 +583,19 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# SCHRITT 6 — Dedup + Secret-Entfernung
-# SINGLES_FILE + PENDING_BLOCKS_FILE → Dedup → CLEAN_FILE
+# SCHRITT 6 — Dedup + Secret-Entfernung + sehr lange Zeilen sichern & entfernen
+#
+# Dedup-Regel:
+#   - Zeilen, die auf \ enden (Continuation-Zeilen in Mehrzeilern),
+#     werden NICHT dedupliziert — sie bleiben immer erhalten.
+#   - Alle anderen Zeilen werden normal dedupliziert (!seen[$0]++).
+#
+# Sehr-lang-Regel (non-backslash-Zeilen > MAX_LINE_LEN Zeichen):
+#   - Diese Zeilen werden in eine Backup-Datei im BACKUP_DIR gesichert
+#     (zsh_hist_longlines.TIMESTAMP.txt) und dann aus der History entfernt.
+#   - Zeilen, die auf \ enden, sind immer geschützt.
+#
+# SINGLES_FILE + PENDING_BLOCKS_FILE → CLEAN_FILE
 # -----------------------------------------------------------------------------
 echo ""
 echo "🧹 SCHRITT 6 — History bereinigen"
@@ -594,12 +606,43 @@ if [[ -s "${PENDING_BLOCKS_FILE}" ]]; then
 fi
 
 ENTRIES_TO_DELETE="/tmp/zsh_hist_delete_${TIMESTAMP}.txt"
+LONGLINES_BACKUP="${BACKUP_DIR}/zsh_hist_longlines.${TIMESTAMP}.txt"
 touch "${ENTRIES_TO_DELETE}"
 
 [[ "${REMOVE_SECRETS}" == "J" ]] && \
   LC_ALL=C grep '^\[.*\] ' "${SECRET_FILE}" | LC_ALL=C sed 's/^\[.*\] //' >> "${ENTRIES_TO_DELETE}"
 
-LC_ALL=C awk '/^[[:space:]]*$/{next} !seen[$0]++{print}' "${SINGLES_FILE}" > "${CLEAN_FILE}"
+# Dedup + Längen-Filter in einem awk-Durchlauf:
+#   \-Zeilen    → immer durchlassen (kein Dedup, kein Längen-Filter)
+#   Leerzeilen  → überspringen
+#   > MAX_LINE_LEN (non-\) → in Backup-Datei schreiben, aus History entfernen
+#   Rest        → normal deduplizieren
+LC_ALL=C awk \
+  -v maxlen="${MAX_LINE_LEN}" \
+  -v longbak="${LONGLINES_BACKUP}" \
+  '
+  /^[[:space:]]*$/ { next }
+  /\\$/ {
+    # Continuation-Zeile: immer behalten, nie deduplizieren
+    print
+    next
+  }
+  length > maxlen {
+    # Sehr lange Non-Continuation-Zeile: in Backup sichern, aus History entfernen
+    print > longbak
+    next
+  }
+  !seen[$0]++ {
+    print
+  }
+  ' "${SINGLES_FILE}" > "${CLEAN_FILE}"
+
+LONGLINES_COUNT=0
+[[ -f "${LONGLINES_BACKUP}" ]] && LONGLINES_COUNT=$(wc -l < "${LONGLINES_BACKUP}" | tr -d ' ')
+if [[ "${LONGLINES_COUNT}" -gt 0 ]]; then
+  echo "   ℹ️  ${LONGLINES_COUNT} sehr lange Zeilen (> ${MAX_LINE_LEN} Zeichen) gesichert:"
+  echo "      → ${LONGLINES_BACKUP}"
+fi
 
 if [[ -s "${ENTRIES_TO_DELETE}" ]]; then
   TEMP_FILTERED="/tmp/zsh_hist_filtered_${TIMESTAMP}.txt"
