@@ -11,9 +11,17 @@
 #   [s] Als Script speichern
 #   [i] In History behalten
 #   [d] Löschen
-#   [m] Nächste 10 Zeilen inline (wiederholbar)
+#   [m] Nächste 10 Zeilen inline (nur bei > 10 Zeilen sichtbar)
 #   [M] Vollständig in less (q zum Beenden, danach Aktion wählen)
+#   [p] Pause — bisherige Entscheidungen speichern, Script beenden
+#       Nächster Start liest Checkpoint automatisch weiter
 #   [q] Abbrechen (restliche Blöcke alle in History behalten)
+#
+# Checkpoint / Resume:
+#   Beim [p]-Pause wird ein Checkpoint unter
+#   ~/.zsh_history_backups/checkpoint_<TIMESTAMP>/ gespeichert.
+#   Beim nächsten Start wird der neueste Checkpoint automatisch
+#   erkannt und gefragt ob weitergemacht werden soll.
 #
 # History-Formate die erkannt werden:
 #   EXTENDED  ": TIMESTAMP:0;cmd\ncmd2"  — ZSH EXTENDED_HISTORY, \n-kodiert
@@ -56,8 +64,10 @@ PENDING_BLOCKS_FILE="/tmp/zsh_hist_pending_${TIMESTAMP}.txt"
 MIN_BLOCK_LINES=3
 LONG_THRESH=200    # Einzelzeilen >= dieser Zeichenanzahl → Schritt 5 Block-Review
 MAX_LINE_LEN=500   # Einzelzeilen (non-backslash) > dieser Zeichenanzahl → in Backup sichern + entfernen
+DISPLAY_MAX_COLS=86  # Maximale Zeichen pro Zeile in der Inline-Anzeige (ohne Rahmen)
 DRY_RUN=0
 SKIP_EXTRACT=0
+RESUME_DIR=""      # wird gefüllt wenn ein Checkpoint geladen wird
 
 # LM Studio API — Namensvorschlag
 LM_API_URL="http://localhost:1234/v1/chat/completions"
@@ -98,9 +108,6 @@ ask() {
 }
 
 # Editierbare Eingabe mit vorausgefülltem Wert — zsh-nativ via vared.
-# vared erlaubt Cursor-Navigation und Backspace in der Eingabezeile.
-# Der Prompt wird vorher auf /dev/tty geschrieben; vared selbst
-# zeigt nur den editierbaren Inhalt.
 ask_edit() {
   local _var="$1" _prompt="$2" _default="$3"
   local _reply="${_default}"
@@ -108,6 +115,68 @@ ask_edit() {
   vared -p '' _reply < /dev/tty > /dev/tty 2>/dev/null
   typeset -g "${_var}"="${_reply:-${_default}}"
 }
+
+# Zeile anzeigen: lange Zeilen mit ... abschneiden und Hinweis anzeigen
+_display_line() {
+  local ln="$1" maxcols=${DISPLAY_MAX_COLS}
+  if [[ ${#ln} -gt ${maxcols} ]]; then
+    printf "   | %s…  [2m(+%d Zeichen → [M] für vollen Inhalt)[0m\n" \
+      "${ln:0:${maxcols}}" $(( ${#ln} - maxcols ))
+  else
+    printf "   | %s\n" "${ln}"
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# SCHRITT 0b — Checkpoint prüfen (Resume-Logik)
+# -----------------------------------------------------------------------------
+_find_latest_checkpoint() {
+  local latest
+  latest=$(ls -1d "${BACKUP_DIR}"/checkpoint_*/  2>/dev/null \
+    | sort | tail -1)
+  [[ -d "${latest}" && -f "${latest}/blocks.raw" \
+     && -f "${latest}/singles.txt" \
+     && -f "${latest}/meta.env" ]] && echo "${latest}" || echo ""
+}
+
+CHECKPOINT_DIR=$(_find_latest_checkpoint)
+if [[ -n "${CHECKPOINT_DIR}" ]]; then
+  echo "📋 Checkpoint gefunden: ${CHECKPOINT_DIR}"
+  source "${CHECKPOINT_DIR}/meta.env" 2>/dev/null || true
+  echo "   Gespeichert am: ${CHECKPOINT_DATE:-?}"
+  echo "   Erledigt: ${CHECKPOINT_DONE:-?} Blöcke (Script:${CHECKPOINT_EXTRACTED:-0} Behalten:${CHECKPOINT_KEPT:-0} Gelöscht:${CHECKPOINT_DELETED:-0})"
+  echo "   Verbleibend: ${CHECKPOINT_REMAINING:-?} Blöcke"
+  ask CP_RESUME "   Dort weitermachen? [J/n] "
+  if [[ "${CP_RESUME}" != "n" && "${CP_RESUME}" != "N" ]]; then
+    RESUME_DIR="${CHECKPOINT_DIR}"
+    echo "   → Resume — überspringe Schritte 1–6, starte direkt bei Block-Review"
+    echo ""
+  else
+    echo "   → Checkpoint ignoriert — starte von vorne"
+    RESUME_DIR=""
+    echo ""
+  fi
+fi
+
+# Im Resume-Modus: direkt zu Schritt 5 springen
+if [[ -n "${RESUME_DIR}" ]]; then
+  # Dateien aus Checkpoint in temporäre Pfade kopieren
+  cp "${RESUME_DIR}/blocks.raw"  "${BLOCKS_RAW}"
+  cp "${RESUME_DIR}/singles.txt" "${SINGLES_FILE}"
+  [[ -f "${RESUME_DIR}/secrets.txt" ]] && cp "${RESUME_DIR}/secrets.txt" "${SECRET_FILE}" \
+    || touch "${SECRET_FILE}"
+  source "${RESUME_DIR}/meta.env" 2>/dev/null || true
+  BLOCK_COUNT=${CHECKPOINT_REMAINING:-0}
+  MERGED_COUNT=${CHECKPOINT_MERGED:-0}
+  REMOVE_SECRETS=${CHECKPOINT_REMOVE_SECRETS:-N}
+  echo "📦 SCHRITT 5 — Resume ab Block ${CHECKPOINT_DONE:-0} (${BLOCK_COUNT} verbleibend)"
+  [[ "${DRY_RUN}" == 1 ]] && echo "   ⚠️  DRY-RUN: Aktionen simuliert, nichts geschrieben"
+  echo ""
+else
+
+# =============================================================================
+# NORMALER START (kein Resume) — Schritte 1–4
+# =============================================================================
 
 # -----------------------------------------------------------------------------
 # SCHRITT 1 — Terminal-Sessions analysieren
@@ -146,7 +215,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# SCHRITT 1.5 — fc -W (eigenes Terminal sofort, andere via AppleScript)
+# SCHRITT 1.5 — fc -W
 # -----------------------------------------------------------------------------
 echo ""
 echo "💾 SCHRITT 1.5 — History auf Disk schreiben (fc -W)"
@@ -397,7 +466,7 @@ rm -f "${BLOCKS_RAW}.raw0"
 echo "   ✓ Blöcke nach Dedup: ${BLOCK_COUNT}"
 
 # -----------------------------------------------------------------------------
-# SCHRITT 2c — Normalisierung Einzelzeilen (nur EXTENDED-Modus)
+# SCHRITT 2c — Normalisierung Einzelzeilen
 # -----------------------------------------------------------------------------
 if [[ "${HIST_FORMAT}" == "EXTENDED" ]]; then
   echo "   → Normalisierung Einzelzeilen (EXTENDED)..."
@@ -513,7 +582,6 @@ fi
 
 # -----------------------------------------------------------------------------
 # SCHRITT 4 — Script-Name ableiten (lokaler Fallback)
-# Extrahiert auch Repo-Namen aus dem Block (git-Befehle, cd-Pfade, URLs)
 # -----------------------------------------------------------------------------
 _derive_script_name() {
   local block="$1" date_prefix=$(date +%Y%m%d) name="" repo=""
@@ -538,13 +606,16 @@ _derive_script_name() {
   fi
 }
 
+mkdir -p "${SCRIPTS_DIR}"
+if [[ ! -d "${SCRIPTS_DIR}/.git" ]]; then
+  git -C "${SCRIPTS_DIR}" init -b main --quiet > /dev/null 2>&1 \
+    || git -C "${SCRIPTS_DIR}" init --quiet > /dev/null 2>&1
+fi
+
+fi  # Ende NORMALER START (kein Resume)
+
 # -----------------------------------------------------------------------------
 # LM Studio Namensvorschlag via lokale API
-#
-# - Wird NACH der Block-Anzeige aufgerufen (parallel lesbar)
-# - Status auf /dev/tty (immer sichtbar, wird danach gelöscht)
-# - Längere, präzisere Namen erlaubt (bis 80 Zeichen nach Datumspräfix)
-# - Fallback: _derive_script_name
 # -----------------------------------------------------------------------------
 _lm_suggest_name() {
   local block="$1"
@@ -552,16 +623,12 @@ _lm_suggest_name() {
 
   printf '   ⏳ KI-Namensvorschlag wird geholt (max %ds)...' "${LM_TIMEOUT}" > /dev/tty
 
-  # repo_hint: KEIN xargs — xargs interpretiert Quotes im Input und wirft
-  # "unterminated quote" wenn der Block einfache Anführungszeichen enthält.
-  # Stattdessen: sed für Whitespace-Normalisierung.
   local repo_hint
   repo_hint=$(printf '%s' "${block}" \
     | LC_ALL=C grep -Eo '(github\.com/[^/]+/[^/" ]+|entware-packages|entware-work|dotfiles[-a-z]*|[-a-z0-9]+\.git)' \
     | LC_ALL=C sed 's|\.git$||' | sort -u | head -3 \
     | tr '\n' ' ' | sed 's/[[:space:]]*$//')
 
-  # branch_hint: git checkout / git switch branch-Namen extrahieren
   local branch_hint
   branch_hint=$(printf '%s' "${block}" \
     | LC_ALL=C grep -Eo 'git (checkout|switch) [^ \\]+' \
@@ -626,46 +693,32 @@ except:
   [[ -n "${name}" ]] && echo "${date_prefix}_${name}"
 }
 
-mkdir -p "${SCRIPTS_DIR}"
-if [[ ! -d "${SCRIPTS_DIR}/.git" ]]; then
-  git -C "${SCRIPTS_DIR}" init -b main --quiet > /dev/null 2>&1 \
-    || git -C "${SCRIPTS_DIR}" init --quiet > /dev/null 2>&1
-fi
-
 # -----------------------------------------------------------------------------
 # SCHRITT 5 — Interaktive Block-Extraktion
-#
-# Ablauf pro Block:
-#   1. Block sofort anzeigen (ohne KI-Vorschlag — Platzhalter "wird geholt...")
-#   2. KI-Vorschlag holen WÄHREND der User liest (Status auf /dev/tty)
-#   3. Vorschlag nachträglich anzeigen (eine Zeile)
-#   4. Aktion wählen
-#   Bei [s]: Name editierbar vorausgefüllt (vared — zsh-nativ)
-#            Nach Speichern: "cat <script>  # → zsh zum Ausführen" in History
 # -----------------------------------------------------------------------------
 touch "${PENDING_BLOCKS_FILE}"
 
 if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
   echo ""
-  echo "📦 SCHRITT 5 — Mehrzeilige Blöcke & lange Einzelbefehle extrahieren"
+  if [[ -z "${RESUME_DIR}" ]]; then
+    echo "📦 SCHRITT 5 — Mehrzeilige Blöcke & lange Einzelbefehle extrahieren"
+  fi
   [[ "${DRY_RUN}" == 1 ]] && echo "   ⚠️  DRY-RUN: Aktionen simuliert, nichts geschrieben"
   echo "   Blöcke (nach Dedup): ${BLOCK_COUNT}  —  nicht entschiedene kommen in History"
   echo ""
 
   BLOCK_IDX=0
-  EXTRACTED_COUNT=0
-  DELETED_COUNT=0
-  KEPT_COUNT=0
+  EXTRACTED_COUNT=${CHECKPOINT_EXTRACTED:-0}
+  DELETED_COUNT=${CHECKPOINT_DELETED:-0}
+  KEPT_COUNT=${CHECKPOINT_KEPT:-0}
   ABORT=0
 
   _show_block_lines() {
     local display="$1" total_lines=$2 idx=$3 total_blocks=$4 from_line=$5 suggested=$6 lm_source=$7
-    # from_line ist 0-basiert; show_to ist die letzte angezeigte Zeile (0-basiert, exklusiv)
     local show_to=$(( from_line + 10 ))
     [[ ${show_to} -gt ${total_lines} ]] && show_to=${total_lines}
-    # Für Anzeige: 1-basierte Zeilennummern
     local display_from=$(( from_line + 1 ))
-    local display_to=${show_to}   # show_to ist bereits die letzte angezeigte Zeile (1-basiert inklusiv)
+    local display_to=${show_to}
     echo "   +----------------------------------------------------------+"
     printf "   |  Block [%d/%d] — %d Zeilen  (Zeilen %d–%d)\n" \
       ${idx} ${total_blocks} ${total_lines} ${display_from} ${display_to}
@@ -678,9 +731,9 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
     printf '%s\n' "${display}" \
       | tail -n +${display_from} \
       | head -n 10 \
-      | while IFS= read -r ln; do printf "   | %.88s\n" "${ln}"; done
+      | while IFS= read -r ln; do _display_line "${ln}"; done
     [[ ${show_to} -lt ${total_lines} ]] && \
-      echo "   | ... (noch $(( total_lines - show_to )) Zeilen)"
+      echo "   | … (noch $(( total_lines - show_to )) Zeilen)"
     echo "   +----------------------------------------------------------+"
   }
 
@@ -690,45 +743,44 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
     [[ -z "${BLOCK_RAW// }" ]] && continue
 
     BLOCK_DISPLAY=$(printf '%s' "${BLOCK_RAW}" | LC_ALL=C sed 's/\\n/\n/g')
-    # printf '%s' (ohne \n am Ende) → wc -l zählt exakt die echten Zeilenumbrüche
     BLOCK_LINES=$(printf '%s' "${BLOCK_DISPLAY}" | wc -l | tr -d ' ')
-    # Ein Block ohne abschließenden Newline hat BLOCK_LINES = Anzahl \n = Zeilen-1
-    # → +1 damit die letzte Zeile mitgezählt wird
     BLOCK_LINES=$(( BLOCK_LINES + 1 ))
     [[ "${BLOCK_LINES}" -lt "${MIN_BLOCK_LINES}" ]] && \
       printf '%s\n' "${BLOCK_DISPLAY}" >> "${PENDING_BLOCKS_FILE}" && continue
 
     BLOCK_IDX=$(( BLOCK_IDX + 1 ))
 
-    # ── 1. Block SOFORT anzeigen (Vorschlag noch unbekannt) ────────────────
     PREVIEW_FROM=0
     _show_block_lines "${BLOCK_DISPLAY}" ${BLOCK_LINES} \
       ${BLOCK_IDX} ${BLOCK_COUNT} ${PREVIEW_FROM} "" ""
     PREVIEW_FROM=10
     echo ""
 
-    # ── 2. KI-Vorschlag holen WÄHREND der User liest ───────────────────────
     LM_SUGGESTED=$(_lm_suggest_name "${BLOCK_DISPLAY}")
     if [[ -n "${LM_SUGGESTED}" ]]; then
       SUGGESTED="${LM_SUGGESTED}"
       LM_SOURCE="KI"
     else
-      SUGGESTED=$(_derive_script_name "${BLOCK_RAW}")
+      SUGGESTED=$(_derive_script_name "${BLOCK_RAW}" 2>/dev/null || echo "script")
       LM_SOURCE="lokal"
     fi
 
-    # ── 3. Vorschlag nachträglich anzeigen ──────────────────────────────
     printf "   🏷  Vorschlag [%s]: %s\n\n" "${LM_SOURCE}" "${SUGGESTED}" > /dev/tty
 
     while true; do
-      echo "   [s] Script  [i] Behalten  [d] Löschen  [m] +10 Zeilen  [M] less  [q] Stop"
+      # [m] nur anbieten wenn noch mehr als die gezeigten Zeilen vorhanden sind
+      if [[ ${BLOCK_LINES} -gt 10 && ${PREVIEW_FROM} -lt ${BLOCK_LINES} ]]; then
+        echo "   [s] Script  [i] Behalten  [d] Löschen  [m] +10 Zeilen  [M] less  [p] Pause  [q] Stop"
+      else
+        echo "   [s] Script  [i] Behalten  [d] Löschen  [M] less  [p] Pause  [q] Stop"
+      fi
       ask ACTION "   Aktion [s]: "
       ACTION="${ACTION:-s}"
 
       case "${ACTION}" in
 
         m)
-          if [[ ${PREVIEW_FROM} -ge ${BLOCK_LINES} ]]; then
+          if [[ ${BLOCK_LINES} -le 10 || ${PREVIEW_FROM} -ge ${BLOCK_LINES} ]]; then
             echo "   (alle ${BLOCK_LINES} Zeilen gezeigt)"
           else
             _show_block_lines "${BLOCK_DISPLAY}" ${BLOCK_LINES} \
@@ -779,6 +831,58 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
           break
           ;;
 
+        p|P)
+          # ── Checkpoint speichern ────────────────────────────────────
+          # Verbleibende Blöcke (ab diesem, inklusiv) in Checkpoint schreiben
+          local CP_DIR="${BACKUP_DIR}/checkpoint_${TIMESTAMP}"
+          mkdir -p "${CP_DIR}"
+
+          # Aktuellen Block + alle noch nicht gelesenen Blöcke in neue .raw Datei
+          {
+            printf '%s\0' "${BLOCK_RAW}"
+            while IFS= read -r -d $'\0' _REST_RAW <&3; do
+              [[ -z "${_REST_RAW// }" ]] && continue
+              printf '%s\0' "${_REST_RAW}"
+            done
+          } > "${CP_DIR}/blocks.raw"
+
+          # Singles + Pending bisher
+          cat "${SINGLES_FILE}" > "${CP_DIR}/singles.txt" 2>/dev/null || true
+          [[ -f "${SECRET_FILE}" ]] && cp "${SECRET_FILE}" "${CP_DIR}/secrets.txt" || true
+
+          # Verbleibende Blöcke zählen
+          local CP_REMAINING
+          CP_REMAINING=$(python3 -c "
+import sys
+data = open('${CP_DIR}/blocks.raw', 'rb').read()
+print(len([b for b in data.split(b'\x00') if b.strip()]))
+" 2>/dev/null || echo 0)
+
+          # Meta-Datei
+          cat > "${CP_DIR}/meta.env" << METAEOF
+CHECKPOINT_DATE="$(date '+%Y-%m-%d %H:%M:%S')"
+CHECKPOINT_DONE=$(( BLOCK_IDX - 1 ))
+CHECKPOINT_REMAINING=${CP_REMAINING}
+CHECKPOINT_EXTRACTED=${EXTRACTED_COUNT}
+CHECKPOINT_KEPT=${KEPT_COUNT}
+CHECKPOINT_DELETED=${DELETED_COUNT}
+CHECKPOINT_MERGED=${MERGED_COUNT}
+CHECKPOINT_REMOVE_SECRETS=${REMOVE_SECRETS}
+METAEOF
+
+          echo "   ⏸  Checkpoint gespeichert: ${CP_DIR}"
+          echo "   ℹ️  Erledigt: $(( BLOCK_IDX - 1 ))  Verbleibend: ${CP_REMAINING}"
+          echo "   → Beim nächsten Start wird automatisch gefragt ob weitergemacht werden soll"
+          echo ""
+
+          # Alten Checkpoint löschen falls vorhanden (nur den vorherigen)
+          [[ -n "${RESUME_DIR}" && "${RESUME_DIR}" != "${CP_DIR}" ]] && \
+            rm -rf "${RESUME_DIR}" 2>/dev/null || true
+
+          ABORT=2  # 2 = sauberer Pause-Exit
+          break 2
+          ;;
+
         q|Q)
           printf '%s\n' "${BLOCK_DISPLAY}" >> "${PENDING_BLOCKS_FILE}"
           ABORT=1
@@ -803,6 +907,7 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
   done
 
   if [[ ${ABORT} -eq 1 ]]; then
+    # [q] Stop: restliche Blöcke in Pending
     while IFS= read -r -d $'\0' BLOCK_RAW <&3; do
       [[ -z "${BLOCK_RAW// }" ]] && continue
       BLOCK_DISPLAY=$(printf '%s' "${BLOCK_RAW}" | LC_ALL=C sed 's/\\n/\n/g')
@@ -812,6 +917,22 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
 
   exec 3<&-
   set -e
+
+  if [[ ${ABORT} -eq 2 ]]; then
+    # [p] Pause — sauber beenden, History NICHT ändern
+    echo ""
+    echo "╔══════════════════════════════════════════════════════╗"
+    echo "║  ⏸️  Pause — Checkpoint gespeichert.                ║"
+    echo "║  History wurde NICHT verändert.                    ║"
+    echo "║  Nächster Start: wird automatisch gefragt.         ║"
+    echo "╚══════════════════════════════════════════════════════╝"
+    echo ""
+    rm -f "${MERGED_DUMP}" "${BLOCKS_RAW}" "${BLOCKS_RAW}.raw0" \
+          "${SINGLES_FILE}" "${CLEAN_FILE}" "${SECRET_FILE}" \
+          "${PENDING_BLOCKS_FILE}" \
+          /tmp/zsh_hist_less_${TIMESTAMP}_*.txt 2>/dev/null || true
+    exit 0
+  fi
 
   PENDING_COUNT=$(wc -l < "${PENDING_BLOCKS_FILE}" | tr -d ' ')
   echo "   ✓ Script: ${EXTRACTED_COUNT}  Löschen: ${DELETED_COUNT}  Behalten: ${KEPT_COUNT}  Pending: ${PENDING_COUNT} Zeilen"
@@ -882,6 +1003,10 @@ fi
 
 CLEAN_COUNT=$(wc -l < "${CLEAN_FILE}" | tr -d ' ')
 echo "   ✓ Bereinigt: ${CLEAN_COUNT} Einträge (war: ${MERGED_COUNT} Rohzeilen)"
+
+# Alten Checkpoint löschen da vollständig abgearbeitet
+[[ -n "${RESUME_DIR}" ]] && rm -rf "${RESUME_DIR}" 2>/dev/null && \
+  echo "   ✓ Checkpoint gelöscht (vollständig abgearbeitet)" || true
 
 # -----------------------------------------------------------------------------
 # SCHRITT 7 — Schreiben
