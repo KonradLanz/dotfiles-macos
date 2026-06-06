@@ -150,18 +150,11 @@ trap '_cleanup_all_tmp' EXIT INT TERM
 # -----------------------------------------------------------------------------
 # SCHRITT 0b — Checkpoint prüfen (Resume-Logik)
 # -----------------------------------------------------------------------------
-# Neuesten gültigen Checkpoint finden — reines zsh-Glob, kein ls, kein Fehler
-# wenn das Verzeichnis leer / nicht existent ist.
 _find_latest_checkpoint() {
   local -a candidates
-  # (N) = null_glob: keine Fehlermeldung wenn nichts passt
-  # (/) = nur Verzeichnisse
   candidates=( "${BACKUP_DIR}"/checkpoint_*/(N/) )
   [[ ${#candidates[@]} -eq 0 ]] && { echo ""; return }
-
-  # Letztes (neuestes) Verzeichnis wählen
   local latest="${candidates[-1]}"
-  # Vollständigkeit prüfen
   if [[ -f "${latest}/blocks.raw" && -f "${latest}/singles.txt" && -f "${latest}/meta.env" ]]; then
     echo "${latest}"
   else
@@ -184,8 +177,6 @@ if [[ -n "${CHECKPOINT_DIR}" ]]; then
   else
     echo "   → Checkpoint ignoriert — starte von vorne"
     RESUME_DIR=""
-    # FIX Bug 1: Checkpoint-Variablen zurücksetzen damit beim Neustart
-    # die Zähler nicht aus dem ignorierten Checkpoint übernommen werden.
     CHECKPOINT_EXTRACTED=0
     CHECKPOINT_KEPT=0
     CHECKPOINT_DELETED=0
@@ -195,7 +186,6 @@ if [[ -n "${CHECKPOINT_DIR}" ]]; then
   fi
 fi
 
-# Im Resume-Modus: direkt zu Schritt 5 springen
 if [[ -n "${RESUME_DIR}" ]]; then
   cp "${RESUME_DIR}/blocks.raw"  "${BLOCKS_RAW}"
   cp "${RESUME_DIR}/singles.txt" "${SINGLES_FILE}"
@@ -732,8 +722,6 @@ except:
 
 # -----------------------------------------------------------------------------
 # Hilfsfunktion: Datum für Script-Header bestimmen
-# Bei EXTENDED: Unix-Timestamp aus dem ersten ": TS:0;"-Marker im Block extrahieren.
-# Bei SIMPLE oder wenn kein Timestamp gefunden: heutiges Datum.
 # -----------------------------------------------------------------------------
 _script_date() {
   local block="$1"
@@ -755,9 +743,6 @@ _script_date() {
 # -----------------------------------------------------------------------------
 touch "${PENDING_BLOCKS_FILE}"
 
-# FIX Bug 2: Gefilterte kurze Blöcke (< MIN_BLOCK_LINES) vor dem aktuellen Block
-# müssen beim Pause-Checkpoint mitgezählt werden. Wir akkumulieren sie in einer
-# separaten Variable und schreiben sie beim [p]-Handler in den Checkpoint.
 _SKIPPED_BLOCKS_RAW=""
 
 if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
@@ -808,8 +793,6 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
     BLOCK_LINES=$(printf '%s' "${BLOCK_DISPLAY}" | wc -l | tr -d ' ')
     BLOCK_LINES=$(( BLOCK_LINES + 1 ))
     if [[ "${BLOCK_LINES}" -lt "${MIN_BLOCK_LINES}" ]]; then
-      # FIX Bug 2: kurze Blöcke akkumulieren — werden beim [p]-Handler
-      # in den Checkpoint geschrieben damit CHECKPOINT_REMAINING stimmt.
       printf '%s\0' "${BLOCK_RAW}" >> "/tmp/zsh_hist_skipped_${TIMESTAMP}.raw" 2>/dev/null || true
       printf '%s\n' "${BLOCK_DISPLAY}" >> "${PENDING_BLOCKS_FILE}"
       continue
@@ -903,18 +886,12 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
           local CP_DIR="${BACKUP_DIR}/checkpoint_${TIMESTAMP}"
           mkdir -p "${CP_DIR}"
 
-          # FIX Bug 2: Zuerst die akkumulierten kurzen (gefilterten) Blöcke
-          # reinschreiben, dann den aktuellen und den Rest — so stimmt
-          # CHECKPOINT_REMAINING mit der tatsächlichen Anzahl überein.
           {
-            # 1. Kurze Blöcke die per continue übersprungen wurden
             local _skipped_raw="/tmp/zsh_hist_skipped_${TIMESTAMP}.raw"
             if [[ -f "${_skipped_raw}" ]]; then
               cat "${_skipped_raw}"
             fi
-            # 2. Aktueller Block (noch nicht entschieden)
             printf '%s\0' "${BLOCK_RAW}"
-            # 3. Rest aus dem fd
             while IFS= read -r -d $'\0' _REST_RAW <&3; do
               [[ -z "${_REST_RAW// }" ]] && continue
               printf '%s\0' "${_REST_RAW}"
@@ -931,10 +908,6 @@ data = open('${CP_DIR}/blocks.raw', 'rb').read()
 print(len([b for b in data.split(b'\x00') if b.strip()]))
 " 2>/dev/null || echo 0)
 
-          # FIX Bug 1: CHECKPOINT_DONE zählt nur entschiedene Blöcke
-          # (BLOCK_IDX - 1), also ohne den aktuellen der noch nicht
-          # entschieden ist. EXTRACTED_COUNT / KEPT_COUNT / DELETED_COUNT
-          # sind die echten Zähler aus dieser Session (ohne Checkpoint-Rest).
           cat > "${CP_DIR}/meta.env" << METAEOF
 CHECKPOINT_DATE="$(date '+%Y-%m-%d %H:%M:%S')"
 CHECKPOINT_DONE=$(( BLOCK_IDX - 1 ))
@@ -992,7 +965,6 @@ METAEOF
   exec 3<&-
   set -e
 
-  # Temporäre Datei für gefilterte kurze Blöcke aufräumen
   rm -f "/tmp/zsh_hist_skipped_${TIMESTAMP}.raw" 2>/dev/null || true
 
   if [[ ${ABORT} -eq 2 ]]; then
@@ -1003,7 +975,6 @@ METAEOF
     echo "║  Nächster Start: wird automatisch gefragt.         ║"
     echo "╚══════════════════════════════════════════════════════╝"
     echo ""
-    # trap EXIT übernimmt das Cleanup — kein manuelles rm nötig
     exit 0
   fi
 
@@ -1109,6 +1080,57 @@ else
   cp "${CLEAN_FILE}" "${HISTFILE}"
   echo "   ✓ ${HISTFILE} aktualisiert (${CLEAN_COUNT} Einträge)"
 
+  # fc -R in diesem Terminal sofort laden
+  fc -R "${HISTFILE}" 2>/dev/null && echo "   ✓ fc -R (dieses Terminal) — History aktualisiert" \
+                                  || echo "   ⚠️  fc -R fehlgeschlagen — manuell: fc -R ~/.zsh_history"
+
+  # fc -R an alle anderen idle Tabs senden
+  echo ""
+  echo "   → Sende fc -R an andere Tabs..."
+  sleep 1  # sicherstellen dass HISTFILE vollständig geflusht ist
+  FCR_RESULT=$(osascript 2>&1 << APPLESCRIPT_FCR
+    set sent_count to 0
+    set skipped_count to 0
+    set error_msg to ""
+    set hist_path to (POSIX file "${HISTFILE}" as text)
+    try
+      tell application "Terminal"
+        repeat with w in windows
+          repeat with t in tabs of w
+            try
+              if busy of t is false then
+                do script "fc -R ${HISTFILE}" in t
+                set sent_count to sent_count + 1
+              else
+                set skipped_count to skipped_count + 1
+              end if
+            on error e
+              set skipped_count to skipped_count + 1
+            end try
+          end repeat
+        end repeat
+      end tell
+    on error e
+      set error_msg to e
+    end try
+    if error_msg is not "" then
+      return "ERROR:" & error_msg
+    else
+      return "OK:" & sent_count & ":" & skipped_count
+    end if
+APPLESCRIPT_FCR
+  )
+  if [[ "${FCR_RESULT}" == ERROR:* ]]; then
+    echo "   ⚠️  fc -R AppleScript Fehler: ${FCR_RESULT#ERROR:}"
+    echo "   → Manuell in anderen Tabs: fc -R ~/.zsh_history"
+  else
+    FCR_SENT="${${FCR_RESULT#OK:}%%:*}"
+    FCR_SKIPPED="${FCR_RESULT##*:}"
+    echo "   ✓ fc -R gesendet an ${FCR_SENT} Tab(s)"
+    [[ "${FCR_SKIPPED}" -gt 0 ]] && \
+      echo "   ℹ️  ${FCR_SKIPPED} Tab(s) busy — dort manuell: fc -R ~/.zsh_history"
+  fi
+
   # FIX: Backup-Duplikate entfernen falls rdfind verfügbar
   if command -v rdfind > /dev/null 2>&1; then
     echo ""
@@ -1128,8 +1150,8 @@ echo "╔═══════════════════════�
 echo "║  ✅ Fertig!  Backup: ~/.zsh_history_backups/         ║"
 if [[ "${DRY_RUN}" != 1 ]]; then
   echo "║                                                      ║"
-  echo "║  ℹ️  History noch nicht aktuell in diesem Tab.       ║"
-  echo "║  → fc -R ~/.zsh_history  oder neues Tab öffnen      ║"
+  echo "║  ✓ History bereits in allen Tabs geladen (fc -R)    ║"
+  echo "║  ℹ️  Busy-Tabs: dort manuell fc -R ~/.zsh_history   ║"
 fi
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
