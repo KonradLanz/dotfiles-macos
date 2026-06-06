@@ -29,21 +29,21 @@
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# SCHRITT 0 — Auto-Pull (immer verbose)
+# SCHRITT 0 — Auto-Pull (deaktiviert — zum Reaktivieren die Kommentare entfernen)
 # -----------------------------------------------------------------------------
-_SCRIPT_DIR="${${(%):-%x}:A:h}"
-if [[ -d "${_SCRIPT_DIR}/../.git" ]]; then
-  echo "🔄 Schritt 0 — Auto-Pull..."
-  _PULL_OUT=$(git -C "${_SCRIPT_DIR}/../" pull --ff-only 2>&1)
-  _PULL_RC=$?
-  if [[ ${_PULL_RC} -eq 0 ]]; then
-    echo "   ${_PULL_OUT}"
-  else
-    echo "   ⚠️  git pull fehlgeschlagen:"
-    echo "   ${_PULL_OUT}"
-    echo "   → Lokale Version wird verwendet"
-  fi
-fi
+# _SCRIPT_DIR="${${(%):-%x}:A:h}"
+# if [[ -d "${_SCRIPT_DIR}/../.git" ]]; then
+#   echo "🔄 Schritt 0 — Auto-Pull..."
+#   _PULL_OUT=$(git -C "${_SCRIPT_DIR}/../" pull --ff-only 2>&1)
+#   _PULL_RC=$?
+#   if [[ ${_PULL_RC} -eq 0 ]]; then
+#     echo "   ${_PULL_OUT}"
+#   else
+#     echo "   ⚠️  git pull fehlgeschlagen:"
+#     echo "   ${_PULL_OUT}"
+#     echo "   → Lokale Version wird verwendet"
+#   fi
+# fi
 
 _HISTFILE_DEFAULT="${HOME}/.zsh_history"
 _HISTFILE="${HISTFILE:-${_HISTFILE_DEFAULT}}"
