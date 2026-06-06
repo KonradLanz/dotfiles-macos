@@ -552,10 +552,22 @@ _lm_suggest_name() {
 
   printf '   ⏳ KI-Namensvorschlag wird geholt (max %ds)...' "${LM_TIMEOUT}" > /dev/tty
 
+  # repo_hint: KEIN xargs — xargs interpretiert Quotes im Input und wirft
+  # "unterminated quote" wenn der Block einfache Anführungszeichen enthält.
+  # Stattdessen: sed für Whitespace-Normalisierung.
   local repo_hint
   repo_hint=$(printf '%s' "${block}" \
     | LC_ALL=C grep -Eo '(github\.com/[^/]+/[^/" ]+|entware-packages|entware-work|dotfiles[-a-z]*|[-a-z0-9]+\.git)' \
-    | LC_ALL=C sed 's|\.git$||' | sort -u | head -3 | tr '\n' ' ' | xargs)
+    | LC_ALL=C sed 's|\.git$||' | sort -u | head -3 \
+    | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+
+  # branch_hint: git checkout / git switch branch-Namen extrahieren
+  local branch_hint
+  branch_hint=$(printf '%s' "${block}" \
+    | LC_ALL=C grep -Eo 'git (checkout|switch) [^ \\]+' \
+    | LC_ALL=C sed 's/git \(checkout\|switch\) //' \
+    | grep -v '^-' | head -2 \
+    | tr '\n' ' ' | sed 's/[[:space:]]*$//')
 
   local user_ctx=""
   [[ -n "${LM_USER_CONTEXT_NAME}"   ]] && user_ctx+="User: ${LM_USER_CONTEXT_NAME}. "
@@ -563,6 +575,7 @@ _lm_suggest_name() {
   [[ -n "${LM_USER_CONTEXT_GITHUB}" ]] && user_ctx+="GitHub: ${LM_USER_CONTEXT_GITHUB}. "
   [[ -n "${LM_USER_CONTEXT_EXTRA}"  ]] && user_ctx+="${LM_USER_CONTEXT_EXTRA}. "
   [[ -n "${repo_hint}"              ]] && user_ctx+="Repos mentioned: ${repo_hint}. "
+  [[ -n "${branch_hint}"            ]] && user_ctx+="Branches mentioned: ${branch_hint}. "
 
   local sys_prompt
   sys_prompt=$(printf '%s' \
@@ -570,6 +583,7 @@ _lm_suggest_name() {
     "Use 3-8 descriptive words that precisely capture what the script does. " \
     "Prefer longer, more specific names over short vague ones. " \
     "Always include the repo/tool name if clearly present. " \
+    "If a branch or feature name is clearly the subject (e.g. feature/enter-once-cache), include it. " \
     "Examples: entware_packages_gh_cli_build_and_deploy_qnap, greev_ssh_ed25519_key_setup, dotfiles_macos_git_sync_pull. " \
     "${user_ctx}")
 
