@@ -26,7 +26,7 @@
 _SCRIPT_DIR="${${(%):-%x}:A:h}"
 if [[ -d "${_SCRIPT_DIR}/../.git" ]]; then
   echo "🔄 Schritt 0 — Auto-Pull..."
-  _PULL_OUT=$(git -C "${_SCRIPT_DIR}/.." pull --ff-only 2>&1)
+  _PULL_OUT=$(git -C "${_SCRIPT_DIR}/../" pull --ff-only 2>&1)
   _PULL_RC=$?
   if [[ ${_PULL_RC} -eq 0 ]]; then
     echo "   ${_PULL_OUT}"
@@ -56,14 +56,6 @@ PENDING_BLOCKS_FILE="/tmp/zsh_hist_pending_${TIMESTAMP}.txt"
 MIN_BLOCK_LINES=3
 LONG_THRESH=200    # Einzelzeilen >= dieser Zeichenanzahl → Schritt 5 Block-Review
 MAX_LINE_LEN=500   # Einzelzeilen (non-backslash) > dieser Zeichenanzahl → in Backup sichern + entfernen
-
-# --- AI Backend Config (local-ai-stack) ---
-# Priorität: Ollama → LM Studio → Regex-Fallback
-OLLAMA_BASE_URL="http://localhost:11434"
-OLLAMA_MODEL="llama3.1:8b"
-LMSTUDIO_BASE_URL="http://localhost:1234/v1"
-# LMSTUDIO_MODEL wird automatisch ermittelt (erster geladener Slot)
-
 DRY_RUN=0
 SKIP_EXTRACT=0
 
@@ -90,223 +82,6 @@ ask() {
   IFS= read -r "_reply?${_prompt}" < /dev/tty
   typeset -g "${_var}"="${_reply}"
 }
-
-# -----------------------------------------------------------------------------
-# Hilfsfunktion: Ollama-Verfügbarkeit prüfen
-# -----------------------------------------------------------------------------
-_ollama_available() {
-  curl -sf --max-time 2 "${OLLAMA_BASE_URL}/api/tags" >/dev/null 2>&1
-}
-
-# -----------------------------------------------------------------------------
-# Hilfsfunktion: LM Studio-Verfügbarkeit prüfen
-# LM Studio spricht die OpenAI-API auf Port 1234.
-# Gibt 0 zurück wenn ein Modell geladen ist (models-Liste nicht leer).
-# -----------------------------------------------------------------------------
-_lmstudio_available() {
-  local models
-  models=$(curl -sf --max-time 2 "${LMSTUDIO_BASE_URL}/models" 2>/dev/null)
-  [[ -n "${models}" ]] && echo "${models}" | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    print('ok' if d.get('data') else '')
-except: pass
-" 2>/dev/null | grep -q 'ok'
-}
-
-# Ermittelt den Namen des ersten geladenen LM Studio-Modells
-_lmstudio_model() {
-  curl -sf --max-time 2 "${LMSTUDIO_BASE_URL}/models" 2>/dev/null | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    models = d.get('data', [])
-    print(models[0]['id'] if models else '')
-except: pass
-" 2>/dev/null
-}
-
-# -----------------------------------------------------------------------------
-# AI-Backend-Status (gecacht, wird einmalig beim ersten Block ermittelt)
-# Werte: 0=ungeprüft  1=Ollama  2=LMStudio  3=kein AI
-# -----------------------------------------------------------------------------
-_AI_BACKEND=0
-_AI_BACKEND_LABEL=""
-
-_detect_ai_backend() {
-  [[ "${_AI_BACKEND}" -ne 0 ]] && return
-
-  # 1. Ollama prüfen
-  if _ollama_available; then
-    _AI_BACKEND=1
-    _AI_BACKEND_LABEL="Ollama (${OLLAMA_MODEL})"
-    echo "   🤖 AI-Backend: ${_AI_BACKEND_LABEL}" >&2
-    return
-  fi
-
-  # Ollama nicht aktiv → einmalig versuchen zu starten
-  echo "   🤖 Ollama nicht aktiv — versuche zu starten..." >&2
-  ollama serve >/dev/null 2>&1 &
-  local waited=0
-  while [[ ${waited} -lt 5 ]]; do
-    sleep 1; waited=$(( waited + 1 ))
-    if _ollama_available; then
-      _AI_BACKEND=1
-      _AI_BACKEND_LABEL="Ollama (${OLLAMA_MODEL}) [neu gestartet]"
-      echo "   🤖 AI-Backend: ${_AI_BACKEND_LABEL}" >&2
-      return
-    fi
-  done
-
-  # 2. LM Studio prüfen
-  if _lmstudio_available; then
-    local lm_model
-    lm_model=$(_lmstudio_model)
-    _AI_BACKEND=2
-    _AI_BACKEND_LABEL="LM Studio (${lm_model:-unbekannt})"
-    echo "   🤖 AI-Backend: ${_AI_BACKEND_LABEL}" >&2
-    return
-  fi
-
-  # 3. Kein AI verfügbar
-  _AI_BACKEND=3
-  echo "   ⚠️  Kein AI-Backend erreichbar — Fallback auf Regex-Namen" >&2
-}
-
-# -----------------------------------------------------------------------------
-# Hilfsfunktion: AI-Namenvorschlag
-# Unterstützt Ollama (/api/generate) und LM Studio (OpenAI /chat/completions).
-#
-# Prompt-Design: fordert explizit ein einzelnes snake_case-Wort ohne Erklärung.
-# Parsing: nimmt nur das erste Whitespace-Token, strippt Backticks/Sonderzeichen,
-# sodass auch verbose Modelle ("Here is the name: foo_bar") korrekt geparst werden.
-# -----------------------------------------------------------------------------
-_derive_script_name_ai() {
-  local block="$1"
-  _detect_ai_backend
-
-  [[ "${_AI_BACKEND}" -eq 3 ]] && return 1
-
-  local preview
-  preview=$(printf '%s' "${block}" | head -8 | \
-    python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" 2>/dev/null) || return 1
-
-  # sys_prompt: klar und restriktiv — erstes Token muss der Name sein
-  local sys_prompt="You are a filename generator. Output ONLY a single snake_case identifier (max 4 words joined by underscores, no extension, no date, all lowercase). Nothing else — no explanation, no punctuation, no markdown."
-  local name raw_result
-
-  # Gemeinsamer Python-Schnipsel zum robusten Parsen des Modell-Outputs.
-  # Nimmt das erste nicht-leere Token, entfernt Backticks/Sonder­zeichen,
-  # kürzt auf 40 Zeichen.
-  local _parse_name_py
-  _parse_name_py='
-import sys, re
-raw = sys.stdin.read().strip()
-# Backticks, Anführungszeichen, Punkte entfernen
-raw = raw.replace("`", "").replace("\'", "").replace('"', "").replace(".", "_")
-# Erstes Whitespace-Token nehmen (verhindert dass Erklärungen durchkommen)
-token = raw.split()[0] if raw.split() else ""
-# Nur erlaubte Zeichen
-token = re.sub(r"[^a-z0-9_]+", "_", token.lower())
-token = re.sub(r"_+", "_", token).strip("_")
-print(token[:40] if token else "")
-'
-
-  if [[ "${_AI_BACKEND}" -eq 1 ]]; then
-    # --- Ollama: /api/generate ---
-    raw_result=$(curl -sf --max-time 8 \
-      "${OLLAMA_BASE_URL}/api/generate" \
-      -H 'Content-Type: application/json' \
-      -d "$(python3 -c "
-import json
-print(json.dumps({
-  'model': '${OLLAMA_MODEL}',
-  'prompt': ${preview},
-  'system': '${sys_prompt}',
-  'stream': False,
-  'options': {'num_predict': 15, 'temperature': 0.1}
-}))
-" 2>/dev/null)" 2>/dev/null) || return 1
-
-    name=$(printf '%s' "${raw_result}" | python3 -c "
-import sys, json
-try:
-    s = json.load(sys.stdin).get('response', '')
-    sys.stdout.write(s)
-except: pass
-" 2>/dev/null | python3 -c "${_parse_name_py}" 2>/dev/null)
-
-  elif [[ "${_AI_BACKEND}" -eq 2 ]]; then
-    # --- LM Studio: OpenAI /chat/completions ---
-    local lm_model
-    lm_model=$(_lmstudio_model)
-    raw_result=$(curl -sf --max-time 8 \
-      "${LMSTUDIO_BASE_URL}/chat/completions" \
-      -H 'Content-Type: application/json' \
-      -d "$(python3 -c "
-import json
-print(json.dumps({
-  'model': '${lm_model}',
-  'messages': [
-    {'role': 'system', 'content': '${sys_prompt}'},
-    {'role': 'user',   'content': 'Script content: ' + ${preview}}
-  ],
-  'max_tokens': 20,
-  'temperature': 0.1,
-  'stream': False
-}))
-" 2>/dev/null)" 2>/dev/null) || return 1
-
-    name=$(printf '%s' "${raw_result}" | python3 -c "
-import sys, json
-try:
-    s = json.load(sys.stdin)['choices'][0]['message']['content']
-    sys.stdout.write(s)
-except: pass
-" 2>/dev/null | python3 -c "${_parse_name_py}" 2>/dev/null)
-  fi
-
-  [[ -n "${name}" ]] && echo "${name}" || return 1
-}
-
-# -----------------------------------------------------------------------------
-# Hilfsfunktion: Regex-Fallback für Script-Name (acook-Bug gefixt)
-# -----------------------------------------------------------------------------
-_derive_script_name_fallback() {
-  local block="$1" date_prefix=$(date +%Y%m%d) name=""
-  name=$(echo "${block}" | LC_ALL=C sed 's/\\n/\n/g' | grep '^#' | head -1 \
-    | sed 's/^#[[:space:]]*//' \
-    | tr '[:upper:]' '[:lower:]' \
-    | tr ' ' '-' \
-    | tr -cd 'a-z0-9-' \
-    | sed 's/-\{2,\}/-/g' \
-    | cut -c1-30)
-  if [[ -z "${name}" ]]; then
-    name=$(echo "${block}" | LC_ALL=C sed 's/\\n/\n/g' | grep -v '^#' | head -1 \
-      | awk '{print $1}' \
-      | tr '[:upper:]' '[:lower:]' \
-      | tr -cd 'a-z0-9_-' \
-      | cut -c1-20)
-  fi
-  [[ -z "${name}" ]] && name="script"
-  echo "${date_prefix}_${name}"
-}
-
-# -----------------------------------------------------------------------------
-# Hilfsfunktion: Script-Name ableiten (AI → Fallback)
-# -----------------------------------------------------------------------------
-_derive_script_name() {
-  local block="$1" date_prefix=$(date +%Y%m%d) ai_name
-  ai_name=$(_derive_script_name_ai "${block}" 2>/dev/null) && \
-    echo "${date_prefix}_${ai_name}" || \
-    _derive_script_name_fallback "${block}"
-}
-
-mkdir -p "${SCRIPTS_DIR}"
-if [[ ! -d "${SCRIPTS_DIR}/.git" ]]; then
-  git -C "${SCRIPTS_DIR}" init -b main --quiet 2>/dev/null || git -C "${SCRIPTS_DIR}" init --quiet
-fi
 
 # -----------------------------------------------------------------------------
 # SCHRITT 1 — Terminal-Sessions analysieren
@@ -449,10 +224,25 @@ echo "   ✓ UTF-8 bereinigt"
 
 # -----------------------------------------------------------------------------
 # SCHRITT 2a — History-Format erkennen
+#
+# EXTENDED: Einträge beginnen mit ": TIMESTAMP:ELAPSED;"
+#           Multiline-Blöcke sind \n-kodiert auf einer Zeile
+#           Beispiel: ": 1717000000:0;cd ~/foo\ngit pull"
+#
+# SIMPLE:   Keine Timestamps. Multiline über echte Zeilenumbrüche,
+#           Continuation-Zeilen enden auf \
+#           Beispiel: "cd ~/foo\"  (Zeile 1)
+#                     "git pull"  (Zeile 2)
+#
+# Entscheidung: >= 10% der Zeilen starten mit ": [0-9]+:[0-9]+;" → EXTENDED
 # -----------------------------------------------------------------------------
 echo "   → History-Format erkennen..."
 
 TOTAL_LINES="${MERGED_COUNT}"
+
+# grep -c gibt auf macOS bei 0 Treffern exit 1 zurück — || true verhindert
+# Script-Abbruch (set -e). tr -d ' \n' entfernt führende Leerzeichen und
+# eventuelle Newlines die grep -c liefern kann.
 EXTENDED_LINES=$(LC_ALL=C grep -c '^: [0-9][0-9]*:[0-9][0-9]*;' "${MERGED_DUMP}" 2>/dev/null || true)
 EXTENDED_LINES=$(printf '%s' "${EXTENDED_LINES}" | tr -d ' \n\r\t')
 [[ -z "${EXTENDED_LINES}" || "${EXTENDED_LINES}" == *[!0-9]* ]] && EXTENDED_LINES=0
@@ -474,12 +264,25 @@ fi
 
 # -----------------------------------------------------------------------------
 # SCHRITT 2b — Block-Erkennung + Dedup
+#
+# EXTENDED-Modus:
+#   Quelle 1: Zeilen mit \n\n (echter Mehrzeiler, \n-kodiert)
+#   Quelle 2: Superlange Einzelzeilen (>= LONG_THRESH Zeichen)
+#
+# SIMPLE-Modus:
+#   Python liest den gesamten Dump und gruppiert:
+#     - Aufeinanderfolgende Zeilen die auf \ enden → Backslash-Continuation-Block
+#     - Einzelzeilen >= LONG_THRESH Zeichen → langer Einzelbefehl (Review)
+#   Einzelzeilen < LONG_THRESH landen direkt in SINGLES_FILE.
+#
+# Alle Blöcke → BLOCKS_RAW (NUL-separiert), dann Python-Dedup.
 # -----------------------------------------------------------------------------
 echo "   → Blöcke erkennen (>= ${MIN_BLOCK_LINES} Zeilen, oder >= ${LONG_THRESH} Zeichen)..."
 
 touch "${BLOCKS_RAW}.raw0"
 
 if [[ "${HIST_FORMAT}" == "EXTENDED" ]]; then
+  # Quelle 1: echte Mehrzeiler (\n-kodiert, mind. 2x \n im String)
   LC_ALL=C grep '\\n.*\\n' "${MERGED_DUMP}" \
     | LC_ALL=C sed \
         -e 's/^[[:space:]]*[0-9]*[[:space:]]*//' \
@@ -488,6 +291,7 @@ if [[ "${HIST_FORMAT}" == "EXTENDED" ]]; then
     | LC_ALL=C tr '\n' '\0' \
     >> "${BLOCKS_RAW}.raw0" 2>/dev/null || true
 
+  # Quelle 2: superlange Einzelzeilen (kein \n, aber >= LONG_THRESH Zeichen)
   LC_ALL=C grep -v '\\n.*\\n' "${MERGED_DUMP}" \
     | LC_ALL=C awk -v thresh="${LONG_THRESH}" 'length >= thresh' \
     | LC_ALL=C sed \
@@ -497,19 +301,23 @@ if [[ "${HIST_FORMAT}" == "EXTENDED" ]]; then
     >> "${BLOCKS_RAW}.raw0" 2>/dev/null || true
 
 else
+  # SIMPLE-Format: Python gruppiert Backslash-Continuation-Blöcke
+  # und schreibt Einzelzeilen direkt in SINGLES_FILE
   export _MERGED_IN="${MERGED_DUMP}"
   export _BLOCKS_OUT="${BLOCKS_RAW}.raw0"
   export _SINGLES_OUT="${SINGLES_FILE}"
   export _LONG_THRESH="${LONG_THRESH}"
 
   python3 << 'PYEOF_SIMPLE'
-import os, sys, re
+import os, sys
 
 merged_in   = os.environ['_MERGED_IN']
 blocks_out  = os.environ['_BLOCKS_OUT']
 singles_out = os.environ['_SINGLES_OUT']
 long_thresh = int(os.environ['_LONG_THRESH'])
 
+# Normalisierungs-Hilfsfunktion: führende Zeilennummern / Timestamp-Präfixe entfernen
+import re
 def strip_prefix(line):
     line = re.sub(r'^: \d+:\d+;', '', line)
     line = re.sub(r'^\s*\d+\s+', '', line)
@@ -517,11 +325,11 @@ def strip_prefix(line):
 
 try:
     raw_lines = open(merged_in, encoding='utf-8', errors='replace').readlines()
-except Exception:
+except Exception as e:
     sys.exit(0)
 
-blocks  = []
-singles = []
+blocks  = []   # Liste von Strings (mehrzeilige Blöcke, NUL-getrennt)
+singles = []   # Einzelzeilen
 
 i = 0
 while i < len(raw_lines):
@@ -529,6 +337,7 @@ while i < len(raw_lines):
     stripped = strip_prefix(line)
 
     if stripped.endswith('\\'):
+        # Backslash-Continuation: sammle alle folgenden Zeilen
         block_lines = [stripped]
         i += 1
         while i < len(raw_lines):
@@ -540,16 +349,19 @@ while i < len(raw_lines):
                 break
         blocks.append('\n'.join(block_lines))
     else:
+        # Einzelzeile
         if stripped and len(stripped) >= long_thresh:
-            blocks.append(stripped)
+            blocks.append(stripped)   # lange Einzelzeile → Review in Schritt 5
         elif stripped:
             singles.append(stripped)
         i += 1
 
+# Blöcke NUL-separiert schreiben
 with open(blocks_out, 'ab') as f:
     for b in blocks:
         f.write(b.encode('utf-8', errors='replace') + b'\x00')
 
+# Einzelzeilen schreiben (append, da Datei möglicherweise schon existiert)
 with open(singles_out, 'a', encoding='utf-8', errors='replace') as f:
     for s in singles:
         f.write(s + '\n')
@@ -558,6 +370,7 @@ PYEOF_SIMPLE
   unset _MERGED_IN _BLOCKS_OUT _SINGLES_OUT _LONG_THRESH
 fi
 
+# Python-Dedup über alle Blöcke (format-unabhängig)
 export _BLOCKS_RAW_IN="${BLOCKS_RAW}.raw0"
 export _BLOCKS_RAW_OUT="${BLOCKS_RAW}"
 BLOCK_COUNT=$(python3 << 'PYEOF_DEDUP'
@@ -565,14 +378,17 @@ import re, os, sys
 
 try:
     data = open(os.environ['_BLOCKS_RAW_IN'], 'rb').read()
-except Exception:
+except Exception as e:
+    print(0, file=sys.stderr)
     print(0)
     raise SystemExit
 
 raw_blocks = [b for b in data.split(b'\x00') if b.strip()]
+
 seen = set()
 uniq = []
 for b in raw_blocks:
+    # Normalisierungsschlüssel: \n-Escape expandieren, Leerzeilen + Whitespace strippen
     key = re.sub(rb'\\n', b'\n', b)
     key = b'\n'.join(ln.strip() for ln in key.splitlines() if ln.strip())
     if key in seen:
@@ -594,6 +410,8 @@ echo "   ✓ Blöcke nach Dedup: ${BLOCK_COUNT}"
 
 # -----------------------------------------------------------------------------
 # SCHRITT 2c — Normalisierung Einzelzeilen (nur EXTENDED-Modus)
+# Im SIMPLE-Modus hat Python die Einzelzeilen bereits in SINGLES_FILE geschrieben.
+# Im EXTENDED-Modus lesen wir sie hier aus dem Dump.
 # -----------------------------------------------------------------------------
 if [[ "${HIST_FORMAT}" == "EXTENDED" ]]; then
   echo "   → Normalisierung Einzelzeilen (EXTENDED)..."
@@ -708,7 +526,29 @@ else
 fi
 
 # -----------------------------------------------------------------------------
+# SCHRITT 4 — Script-Name ableiten
+# -----------------------------------------------------------------------------
+_derive_script_name() {
+  local block="$1" date_prefix=$(date +%Y%m%d) name=""
+  name=$(echo "${block}" | LC_ALL=C sed 's/\\n/\n/g' | grep '^#' | head -1 \
+    | sed 's/^#[[:space:]]*//' | tr ' ' '-' | tr -cd 'a-z0-9-' | cut -c1-30)
+  if [[ -z "${name}" ]]; then
+    name=$(echo "${block}" | LC_ALL=C sed 's/\\n/\n/g' | grep -v '^#' | head -1 \
+      | awk '{print $1}' | tr -cd 'a-z0-9_-' | cut -c1-20)
+  fi
+  [[ -z "${name}" ]] && name="script"
+  echo "${date_prefix}_${name}"
+}
+
+mkdir -p "${SCRIPTS_DIR}"
+if [[ ! -d "${SCRIPTS_DIR}/.git" ]]; then
+  git -C "${SCRIPTS_DIR}" init -b main --quiet 2>/dev/null || git -C "${SCRIPTS_DIR}" init --quiet
+fi
+
+# -----------------------------------------------------------------------------
 # SCHRITT 5 — Interaktive Block-Extraktion
+# Nicht entschiedene Blöcke → PENDING_BLOCKS_FILE → kommen in History.
+# [M] less: tmp-Datei über /dev/tty als Vordergrundprozess.
 # -----------------------------------------------------------------------------
 touch "${PENDING_BLOCKS_FILE}"
 
@@ -726,14 +566,12 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
   ABORT=0
 
   _show_block_lines() {
-    local display="$1" total_lines=$2 idx=$3 total_blocks=$4 from_line=$5 suggested="$6"
+    local display="$1" total_lines=$2 idx=$3 total_blocks=$4 from_line=$5
     local show_to=$(( from_line + 10 ))
     [[ ${show_to} -gt ${total_lines} ]] && show_to=${total_lines}
     echo "   +----------------------------------------------------------+"
     printf "   |  Block [%d/%d] — %d Zeilen  (Zeilen %d–%d)\n" \
       ${idx} ${total_blocks} ${total_lines} $(( from_line + 1 )) ${show_to}
-    # Namensvorschlag direkt im Header anzeigen (schon bereit wenn du [s] drückst)
-    [[ -n "${suggested}" ]] && printf "   |  🏷  Vorschlag: %s\n" "${suggested}"
     echo "   +----------------------------------------------------------+"
     printf '%s\n' "${display}" \
       | tail -n +$(( from_line + 1 )) \
@@ -755,12 +593,11 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
       printf '%s\n' "${BLOCK_DISPLAY}" >> "${PENDING_BLOCKS_FILE}" && continue
 
     BLOCK_IDX=$(( BLOCK_IDX + 1 ))
-    # AI-Vorschlag VOR dem Anzeigen berechnen → ist schon im Header sichtbar
     SUGGESTED=$(_derive_script_name "${BLOCK_RAW}")
     PREVIEW_FROM=0
 
     _show_block_lines "${BLOCK_DISPLAY}" ${BLOCK_LINES} \
-      ${BLOCK_IDX} ${BLOCK_COUNT} ${PREVIEW_FROM} "${SUGGESTED}"
+      ${BLOCK_IDX} ${BLOCK_COUNT} ${PREVIEW_FROM}
     PREVIEW_FROM=10
     echo ""
 
@@ -776,7 +613,7 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
             echo "   (alle ${BLOCK_LINES} Zeilen gezeigt)"
           else
             _show_block_lines "${BLOCK_DISPLAY}" ${BLOCK_LINES} \
-              ${BLOCK_IDX} ${BLOCK_COUNT} ${PREVIEW_FROM} "${SUGGESTED}"
+              ${BLOCK_IDX} ${BLOCK_COUNT} ${PREVIEW_FROM}
             PREVIEW_FROM=$(( PREVIEW_FROM + 10 ))
           fi
           echo ""
@@ -873,6 +710,18 @@ fi
 
 # -----------------------------------------------------------------------------
 # SCHRITT 6 — Dedup + Secret-Entfernung + sehr lange Zeilen sichern & entfernen
+#
+# Dedup-Regel:
+#   - Zeilen, die auf \ enden (Continuation-Zeilen in Mehrzeilern),
+#     werden NICHT dedupliziert — sie bleiben immer erhalten.
+#   - Alle anderen Zeilen werden normal dedupliziert (!seen[$0]++).
+#
+# Sehr-lang-Regel (non-backslash-Zeilen > MAX_LINE_LEN Zeichen):
+#   - Diese Zeilen werden in eine Backup-Datei im BACKUP_DIR gesichert
+#     (zsh_hist_longlines.TIMESTAMP.txt) und dann aus der History entfernt.
+#   - Zeilen, die auf \ enden, sind immer geschützt.
+#
+# SINGLES_FILE + PENDING_BLOCKS_FILE → CLEAN_FILE
 # -----------------------------------------------------------------------------
 echo ""
 echo "🧹 SCHRITT 6 — History bereinigen"
@@ -889,16 +738,23 @@ touch "${ENTRIES_TO_DELETE}"
 [[ "${REMOVE_SECRETS}" == "J" ]] && \
   LC_ALL=C grep '^\[.*\] ' "${SECRET_FILE}" | LC_ALL=C sed 's/^\[.*\] //' >> "${ENTRIES_TO_DELETE}"
 
+# Dedup + Längen-Filter in einem awk-Durchlauf:
+#   \-Zeilen    → immer durchlassen (kein Dedup, kein Längen-Filter)
+#   Leerzeilen  → überspringen
+#   > MAX_LINE_LEN (non-\) → in Backup-Datei schreiben, aus History entfernen
+#   Rest        → normal deduplizieren
 LC_ALL=C awk \
   -v maxlen="${MAX_LINE_LEN}" \
   -v longbak="${LONGLINES_BACKUP}" \
   '
   /^[[:space:]]*$/ { next }
   /\\$/ {
+    # Continuation-Zeile: immer behalten, nie deduplizieren
     print
     next
   }
   length > maxlen {
+    # Sehr lange Non-Continuation-Zeile: in Backup sichern, aus History entfernen
     print > longbak
     next
   }
