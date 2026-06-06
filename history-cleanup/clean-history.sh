@@ -59,6 +59,11 @@ MAX_LINE_LEN=500   # Einzelzeilen (non-backslash) > dieser Zeichenanzahl → in 
 DRY_RUN=0
 SKIP_EXTRACT=0
 
+# LM Studio API — Namensvorschlag
+LM_API_URL="http://localhost:1234/v1/chat/completions"
+LM_MODEL=""   # leer = LM Studio wählt aktiv geladenes Modell
+LM_TIMEOUT=8  # Sekunden bis Timeout
+
 for arg in "$@"; do
   case "$arg" in
     --dry-run)      DRY_RUN=1 ;;
@@ -224,25 +229,10 @@ echo "   ✓ UTF-8 bereinigt"
 
 # -----------------------------------------------------------------------------
 # SCHRITT 2a — History-Format erkennen
-#
-# EXTENDED: Einträge beginnen mit ": TIMESTAMP:ELAPSED;"
-#           Multiline-Blöcke sind \n-kodiert auf einer Zeile
-#           Beispiel: ": 1717000000:0;cd ~/foo\ngit pull"
-#
-# SIMPLE:   Keine Timestamps. Multiline über echte Zeilenumbrüche,
-#           Continuation-Zeilen enden auf \
-#           Beispiel: "cd ~/foo\"  (Zeile 1)
-#                     "git pull"  (Zeile 2)
-#
-# Entscheidung: >= 10% der Zeilen starten mit ": [0-9]+:[0-9]+;" → EXTENDED
 # -----------------------------------------------------------------------------
 echo "   → History-Format erkennen..."
 
 TOTAL_LINES="${MERGED_COUNT}"
-
-# grep -c gibt auf macOS bei 0 Treffern exit 1 zurück — || true verhindert
-# Script-Abbruch (set -e). tr -d ' \n' entfernt führende Leerzeichen und
-# eventuelle Newlines die grep -c liefern kann.
 EXTENDED_LINES=$(LC_ALL=C grep -c '^: [0-9][0-9]*:[0-9][0-9]*;' "${MERGED_DUMP}" 2>/dev/null || true)
 EXTENDED_LINES=$(printf '%s' "${EXTENDED_LINES}" | tr -d ' \n\r\t')
 [[ -z "${EXTENDED_LINES}" || "${EXTENDED_LINES}" == *[!0-9]* ]] && EXTENDED_LINES=0
@@ -264,25 +254,12 @@ fi
 
 # -----------------------------------------------------------------------------
 # SCHRITT 2b — Block-Erkennung + Dedup
-#
-# EXTENDED-Modus:
-#   Quelle 1: Zeilen mit \n\n (echter Mehrzeiler, \n-kodiert)
-#   Quelle 2: Superlange Einzelzeilen (>= LONG_THRESH Zeichen)
-#
-# SIMPLE-Modus:
-#   Python liest den gesamten Dump und gruppiert:
-#     - Aufeinanderfolgende Zeilen die auf \ enden → Backslash-Continuation-Block
-#     - Einzelzeilen >= LONG_THRESH Zeichen → langer Einzelbefehl (Review)
-#   Einzelzeilen < LONG_THRESH landen direkt in SINGLES_FILE.
-#
-# Alle Blöcke → BLOCKS_RAW (NUL-separiert), dann Python-Dedup.
 # -----------------------------------------------------------------------------
 echo "   → Blöcke erkennen (>= ${MIN_BLOCK_LINES} Zeilen, oder >= ${LONG_THRESH} Zeichen)..."
 
 touch "${BLOCKS_RAW}.raw0"
 
 if [[ "${HIST_FORMAT}" == "EXTENDED" ]]; then
-  # Quelle 1: echte Mehrzeiler (\n-kodiert, mind. 2x \n im String)
   LC_ALL=C grep '\\n.*\\n' "${MERGED_DUMP}" \
     | LC_ALL=C sed \
         -e 's/^[[:space:]]*[0-9]*[[:space:]]*//' \
@@ -291,7 +268,6 @@ if [[ "${HIST_FORMAT}" == "EXTENDED" ]]; then
     | LC_ALL=C tr '\n' '\0' \
     >> "${BLOCKS_RAW}.raw0" 2>/dev/null || true
 
-  # Quelle 2: superlange Einzelzeilen (kein \n, aber >= LONG_THRESH Zeichen)
   LC_ALL=C grep -v '\\n.*\\n' "${MERGED_DUMP}" \
     | LC_ALL=C awk -v thresh="${LONG_THRESH}" 'length >= thresh' \
     | LC_ALL=C sed \
@@ -301,8 +277,6 @@ if [[ "${HIST_FORMAT}" == "EXTENDED" ]]; then
     >> "${BLOCKS_RAW}.raw0" 2>/dev/null || true
 
 else
-  # SIMPLE-Format: Python gruppiert Backslash-Continuation-Blöcke
-  # und schreibt Einzelzeilen direkt in SINGLES_FILE
   export _MERGED_IN="${MERGED_DUMP}"
   export _BLOCKS_OUT="${BLOCKS_RAW}.raw0"
   export _SINGLES_OUT="${SINGLES_FILE}"
@@ -316,7 +290,6 @@ blocks_out  = os.environ['_BLOCKS_OUT']
 singles_out = os.environ['_SINGLES_OUT']
 long_thresh = int(os.environ['_LONG_THRESH'])
 
-# Normalisierungs-Hilfsfunktion: führende Zeilennummern / Timestamp-Präfixe entfernen
 import re
 def strip_prefix(line):
     line = re.sub(r'^: \d+:\d+;', '', line)
@@ -328,8 +301,8 @@ try:
 except Exception as e:
     sys.exit(0)
 
-blocks  = []   # Liste von Strings (mehrzeilige Blöcke, NUL-getrennt)
-singles = []   # Einzelzeilen
+blocks  = []
+singles = []
 
 i = 0
 while i < len(raw_lines):
@@ -337,7 +310,6 @@ while i < len(raw_lines):
     stripped = strip_prefix(line)
 
     if stripped.endswith('\\'):
-        # Backslash-Continuation: sammle alle folgenden Zeilen
         block_lines = [stripped]
         i += 1
         while i < len(raw_lines):
@@ -349,19 +321,16 @@ while i < len(raw_lines):
                 break
         blocks.append('\n'.join(block_lines))
     else:
-        # Einzelzeile
         if stripped and len(stripped) >= long_thresh:
-            blocks.append(stripped)   # lange Einzelzeile → Review in Schritt 5
+            blocks.append(stripped)
         elif stripped:
             singles.append(stripped)
         i += 1
 
-# Blöcke NUL-separiert schreiben
 with open(blocks_out, 'ab') as f:
     for b in blocks:
         f.write(b.encode('utf-8', errors='replace') + b'\x00')
 
-# Einzelzeilen schreiben (append, da Datei möglicherweise schon existiert)
 with open(singles_out, 'a', encoding='utf-8', errors='replace') as f:
     for s in singles:
         f.write(s + '\n')
@@ -370,7 +339,6 @@ PYEOF_SIMPLE
   unset _MERGED_IN _BLOCKS_OUT _SINGLES_OUT _LONG_THRESH
 fi
 
-# Python-Dedup über alle Blöcke (format-unabhängig)
 export _BLOCKS_RAW_IN="${BLOCKS_RAW}.raw0"
 export _BLOCKS_RAW_OUT="${BLOCKS_RAW}"
 BLOCK_COUNT=$(python3 << 'PYEOF_DEDUP'
@@ -388,7 +356,6 @@ raw_blocks = [b for b in data.split(b'\x00') if b.strip()]
 seen = set()
 uniq = []
 for b in raw_blocks:
-    # Normalisierungsschlüssel: \n-Escape expandieren, Leerzeilen + Whitespace strippen
     key = re.sub(rb'\\n', b'\n', b)
     key = b'\n'.join(ln.strip() for ln in key.splitlines() if ln.strip())
     if key in seen:
@@ -410,8 +377,6 @@ echo "   ✓ Blöcke nach Dedup: ${BLOCK_COUNT}"
 
 # -----------------------------------------------------------------------------
 # SCHRITT 2c — Normalisierung Einzelzeilen (nur EXTENDED-Modus)
-# Im SIMPLE-Modus hat Python die Einzelzeilen bereits in SINGLES_FILE geschrieben.
-# Im EXTENDED-Modus lesen wir sie hier aus dem Dump.
 # -----------------------------------------------------------------------------
 if [[ "${HIST_FORMAT}" == "EXTENDED" ]]; then
   echo "   → Normalisierung Einzelzeilen (EXTENDED)..."
@@ -526,7 +491,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# SCHRITT 4 — Script-Name ableiten
+# SCHRITT 4 — Script-Name ableiten (lokaler Fallback)
 # -----------------------------------------------------------------------------
 _derive_script_name() {
   local block="$1" date_prefix=$(date +%Y%m%d) name=""
@@ -540,6 +505,67 @@ _derive_script_name() {
   echo "${date_prefix}_${name}"
 }
 
+# -----------------------------------------------------------------------------
+# LM Studio Namensvorschlag via API
+# Gibt einen einzelnen snake_case-Token zurück, oder leer bei Fehler/Timeout.
+# Wird in Schritt 5 VOR der Block-Anzeige aufgerufen.
+# -----------------------------------------------------------------------------
+_lm_suggest_name() {
+  local block="$1"
+  local date_prefix=$(date +%Y%m%d)
+
+  # Ersten 800 Zeichen des Blocks als Kontext
+  local snippet
+  snippet=$(printf '%s' "${block}" | head -c 800 | LC_ALL=C sed "s/'/\\\\'/g; s/\"/\\\\\"/g")
+
+  # JSON-Body bauen
+  local payload
+  payload=$(printf '{
+    "model": "%s",
+    "max_tokens": 20,
+    "temperature": 0.1,
+    "messages": [
+      {"role": "system", "content": "You are a script naming assistant. Reply with ONLY a single snake_case filename token (no extension, no explanation, no quotes, 2-5 words max). Date prefix will be added automatically."},
+      {"role": "user", "content": "Name this shell script block:\n\n%s"}
+    ]
+  }' "${LM_MODEL}" "${snippet}")
+
+  local raw_response
+  raw_response=$(curl -s \
+    --max-time "${LM_TIMEOUT}" \
+    -X POST "${LM_API_URL}" \
+    -H 'Content-Type: application/json' \
+    -d "${payload}" 2>/dev/null) || true
+
+  if [[ -z "${raw_response}" ]]; then
+    echo ""
+    return
+  fi
+
+  # Ersten Token aus content extrahieren, Backticks/Quotes/Erklärungen wegwerfen
+  local name
+  name=$(printf '%s' "${raw_response}" \
+    | python3 -c "
+import sys, json, re
+try:
+    data = json.load(sys.stdin)
+    text = data['choices'][0]['message']['content'].strip()
+    # Erstes Wort-Token, Sonderzeichen entfernen
+    token = re.split(r'[\s:,\"\x60]+', text.strip('\"\x60 '))[0]
+    token = re.sub(r'[^a-z0-9_-]', '', token.lower())
+    token = token[:40]
+    print(token if len(token) >= 3 else '')
+except:
+    print('')
+" 2>/dev/null) || true
+
+  if [[ -n "${name}" ]]; then
+    echo "${date_prefix}_${name}"
+  else
+    echo ""
+  fi
+}
+
 mkdir -p "${SCRIPTS_DIR}"
 if [[ ! -d "${SCRIPTS_DIR}/.git" ]]; then
   git -C "${SCRIPTS_DIR}" init -b main --quiet 2>/dev/null || git -C "${SCRIPTS_DIR}" init --quiet
@@ -547,8 +573,7 @@ fi
 
 # -----------------------------------------------------------------------------
 # SCHRITT 5 — Interaktive Block-Extraktion
-# Nicht entschiedene Blöcke → PENDING_BLOCKS_FILE → kommen in History.
-# [M] less: tmp-Datei über /dev/tty als Vordergrundprozess.
+# LM-Studio-Vorschlag wird VOR der Block-Anzeige geholt → immer sichtbar.
 # -----------------------------------------------------------------------------
 touch "${PENDING_BLOCKS_FILE}"
 
@@ -566,12 +591,15 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
   ABORT=0
 
   _show_block_lines() {
-    local display="$1" total_lines=$2 idx=$3 total_blocks=$4 from_line=$5
+    local display="$1" total_lines=$2 idx=$3 total_blocks=$4 from_line=$5 suggested=$6
     local show_to=$(( from_line + 10 ))
     [[ ${show_to} -gt ${total_lines} ]] && show_to=${total_lines}
     echo "   +----------------------------------------------------------+"
     printf "   |  Block [%d/%d] — %d Zeilen  (Zeilen %d–%d)\n" \
       ${idx} ${total_blocks} ${total_lines} $(( from_line + 1 )) ${show_to}
+    if [[ -n "${suggested}" ]]; then
+      printf "   |  🏷  Vorschlag: %s\n" "${suggested}"
+    fi
     echo "   +----------------------------------------------------------+"
     printf '%s\n' "${display}" \
       | tail -n +$(( from_line + 1 )) \
@@ -593,11 +621,23 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
       printf '%s\n' "${BLOCK_DISPLAY}" >> "${PENDING_BLOCKS_FILE}" && continue
 
     BLOCK_IDX=$(( BLOCK_IDX + 1 ))
-    SUGGESTED=$(_derive_script_name "${BLOCK_RAW}")
-    PREVIEW_FROM=0
 
+    # ── LM-Studio-Vorschlag VOR der Anzeige holen ──────────────────────────
+    printf '   ⏳ Hole Namensvorschlag...' >&2
+    LM_SUGGESTED=$(_lm_suggest_name "${BLOCK_DISPLAY}")
+    printf '\r   %-40s\r' '' >&2   # Zeile löschen
+
+    # Fallback auf lokalen Algorithmus wenn LM leer/offline
+    if [[ -z "${LM_SUGGESTED}" ]]; then
+      SUGGESTED=$(_derive_script_name "${BLOCK_RAW}")
+    else
+      SUGGESTED="${LM_SUGGESTED}"
+    fi
+    # ────────────────────────────────────────────────────────────────────────
+
+    PREVIEW_FROM=0
     _show_block_lines "${BLOCK_DISPLAY}" ${BLOCK_LINES} \
-      ${BLOCK_IDX} ${BLOCK_COUNT} ${PREVIEW_FROM}
+      ${BLOCK_IDX} ${BLOCK_COUNT} ${PREVIEW_FROM} "${SUGGESTED}"
     PREVIEW_FROM=10
     echo ""
 
@@ -613,7 +653,7 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
             echo "   (alle ${BLOCK_LINES} Zeilen gezeigt)"
           else
             _show_block_lines "${BLOCK_DISPLAY}" ${BLOCK_LINES} \
-              ${BLOCK_IDX} ${BLOCK_COUNT} ${PREVIEW_FROM}
+              ${BLOCK_IDX} ${BLOCK_COUNT} ${PREVIEW_FROM} "${SUGGESTED}"
             PREVIEW_FROM=$(( PREVIEW_FROM + 10 ))
           fi
           echo ""
@@ -710,18 +750,6 @@ fi
 
 # -----------------------------------------------------------------------------
 # SCHRITT 6 — Dedup + Secret-Entfernung + sehr lange Zeilen sichern & entfernen
-#
-# Dedup-Regel:
-#   - Zeilen, die auf \ enden (Continuation-Zeilen in Mehrzeilern),
-#     werden NICHT dedupliziert — sie bleiben immer erhalten.
-#   - Alle anderen Zeilen werden normal dedupliziert (!seen[$0]++).
-#
-# Sehr-lang-Regel (non-backslash-Zeilen > MAX_LINE_LEN Zeichen):
-#   - Diese Zeilen werden in eine Backup-Datei im BACKUP_DIR gesichert
-#     (zsh_hist_longlines.TIMESTAMP.txt) und dann aus der History entfernt.
-#   - Zeilen, die auf \ enden, sind immer geschützt.
-#
-# SINGLES_FILE + PENDING_BLOCKS_FILE → CLEAN_FILE
 # -----------------------------------------------------------------------------
 echo ""
 echo "🧹 SCHRITT 6 — History bereinigen"
@@ -738,23 +766,16 @@ touch "${ENTRIES_TO_DELETE}"
 [[ "${REMOVE_SECRETS}" == "J" ]] && \
   LC_ALL=C grep '^\[.*\] ' "${SECRET_FILE}" | LC_ALL=C sed 's/^\[.*\] //' >> "${ENTRIES_TO_DELETE}"
 
-# Dedup + Längen-Filter in einem awk-Durchlauf:
-#   \-Zeilen    → immer durchlassen (kein Dedup, kein Längen-Filter)
-#   Leerzeilen  → überspringen
-#   > MAX_LINE_LEN (non-\) → in Backup-Datei schreiben, aus History entfernen
-#   Rest        → normal deduplizieren
 LC_ALL=C awk \
   -v maxlen="${MAX_LINE_LEN}" \
   -v longbak="${LONGLINES_BACKUP}" \
   '
   /^[[:space:]]*$/ { next }
   /\\$/ {
-    # Continuation-Zeile: immer behalten, nie deduplizieren
     print
     next
   }
   length > maxlen {
-    # Sehr lange Non-Continuation-Zeile: in Backup sichern, aus History entfernen
     print > longbak
     next
   }
