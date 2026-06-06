@@ -14,6 +14,10 @@
 #   [m] Nächste 10 Zeilen inline (wiederholbar)
 #   [M] Vollständig in less (q zum Beenden, danach Aktion wählen)
 #   [q] Abbrechen (restliche Blöcke alle in History behalten)
+#
+# History-Formate die erkannt werden:
+#   EXTENDED  ": TIMESTAMP:0;cmd\ncmd2"  — ZSH EXTENDED_HISTORY, \n-kodiert
+#   SIMPLE    "cmd"  (eine oder mehrere Zeilen, Backslash-Continuation möglich)
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -219,37 +223,146 @@ iconv -f UTF-8 -t UTF-8 -c "${MERGED_DUMP}" > "${MERGED_DUMP}.utf8" 2>/dev/null 
 echo "   ✓ UTF-8 bereinigt"
 
 # -----------------------------------------------------------------------------
-# SCHRITT 2b — Block-Erkennung + Dedup
-# BLOCKS_RAW.raw0 = alle Rohblöcke (NUL-separiert)
-# BLOCKS_RAW      = nach Dedup (gleicher normalisierter Inhalt = Duplikat)
+# SCHRITT 2a — History-Format erkennen
 #
-# Zwei Quellen landen in BLOCKS_RAW:
-#   1. Echte Mehrzeiler (enthalten \n im Dump-Format)
-#   2. Superlange Einzelzeilen (>= LONG_THRESH Zeichen) — kein \n, aber
-#      zu komplex für stummes Behalten → manuelles Review in Schritt 5
+# EXTENDED: Einträge beginnen mit ": TIMESTAMP:ELAPSED;"
+#           Multiline-Blöcke sind \n-kodiert auf einer Zeile
+#           Beispiel: ": 1717000000:0;cd ~/foo\ngit pull"
+#
+# SIMPLE:   Keine Timestamps. Multiline über echte Zeilenumbrüche,
+#           Continuation-Zeilen enden auf \
+#           Beispiel: "cd ~/foo\"  (Zeile 1)
+#                     "git pull"  (Zeile 2)
+#
+# Entscheidung: >= 10% der Zeilen starten mit ": [0-9]+:[0-9]+;" → EXTENDED
+# -----------------------------------------------------------------------------
+echo "   → History-Format erkennen..."
+
+TOTAL_LINES="${MERGED_COUNT}"
+EXTENDED_LINES=$(LC_ALL=C grep -c '^: [0-9][0-9]*:[0-9][0-9]*;' "${MERGED_DUMP}" 2>/dev/null || echo 0)
+EXTENDED_RATIO=0
+[[ "${TOTAL_LINES}" -gt 0 ]] && \
+  EXTENDED_RATIO=$(( EXTENDED_LINES * 100 / TOTAL_LINES ))
+
+if [[ "${EXTENDED_RATIO}" -ge 10 ]]; then
+  HIST_FORMAT="EXTENDED"
+  echo "   ✓ Format: EXTENDED (Timestamps, ${EXTENDED_LINES} von ${TOTAL_LINES} Zeilen = ${EXTENDED_RATIO}%)"
+  echo "     → Multiline-Blöcke: \\n-kodiert auf einer Zeile"
+else
+  HIST_FORMAT="SIMPLE"
+  echo "   ✓ Format: SIMPLE (keine Timestamps, ${EXTENDED_LINES} von ${TOTAL_LINES} Zeilen = ${EXTENDED_RATIO}%)"
+  echo "     → Multiline-Blöcke: echte Zeilenumbrüche + Backslash-Continuation"
+fi
+
+# -----------------------------------------------------------------------------
+# SCHRITT 2b — Block-Erkennung + Dedup
+#
+# EXTENDED-Modus:
+#   Quelle 1: Zeilen mit \n\n (echter Mehrzeiler, \n-kodiert)
+#   Quelle 2: Superlange Einzelzeilen (>= LONG_THRESH Zeichen)
+#
+# SIMPLE-Modus:
+#   Python liest den gesamten Dump und gruppiert:
+#     - Aufeinanderfolgende Zeilen die auf \ enden → Backslash-Continuation-Block
+#     - Einzelzeilen >= LONG_THRESH Zeichen → langer Einzelbefehl (Review)
+#   Einzelzeilen < LONG_THRESH landen direkt in SINGLES_FILE.
+#
+# Alle Blöcke → BLOCKS_RAW (NUL-separiert), dann Python-Dedup.
 # -----------------------------------------------------------------------------
 echo "   → Blöcke erkennen (>= ${MIN_BLOCK_LINES} Zeilen, oder >= ${LONG_THRESH} Zeichen)..."
 
-# Quelle 1: echte Mehrzeiler (enthalten \n...\n)
-LC_ALL=C grep '\\n.*\\n' "${MERGED_DUMP}" \
-  | LC_ALL=C sed \
-      -e 's/^[[:space:]]*[0-9]*[[:space:]]*//' \
-      -e 's/^: [0-9]*:[0-9]*;//' \
-      -e 's/\\n$//' \
-  | LC_ALL=C tr '\n' '\0' \
-  > "${BLOCKS_RAW}.raw0" 2>/dev/null || true
+touch "${BLOCKS_RAW}.raw0"
 
-# Quelle 2: superlange Einzelzeilen (kein \n, aber >= LONG_THRESH Zeichen)
-LC_ALL=C grep -v '\\n.*\\n' "${MERGED_DUMP}" \
-  | LC_ALL=C awk -v thresh="${LONG_THRESH}" 'length >= thresh' \
-  | LC_ALL=C sed \
-      -e 's/^[[:space:]]*[0-9]*[[:space:]]*//' \
-      -e 's/^: [0-9]*:[0-9]*;//' \
-  | LC_ALL=C tr '\n' '\0' \
-  >> "${BLOCKS_RAW}.raw0" 2>/dev/null || true
+if [[ "${HIST_FORMAT}" == "EXTENDED" ]]; then
+  # Quelle 1: echte Mehrzeiler (\n-kodiert, mind. 2x \n im String)
+  LC_ALL=C grep '\\n.*\\n' "${MERGED_DUMP}" \
+    | LC_ALL=C sed \
+        -e 's/^[[:space:]]*[0-9]*[[:space:]]*//' \
+        -e 's/^: [0-9]*:[0-9]*;//' \
+        -e 's/\\n$//' \
+    | LC_ALL=C tr '\n' '\0' \
+    >> "${BLOCKS_RAW}.raw0" 2>/dev/null || true
 
-# Python-Dedup: Heredoc GEQUOTET ('PYEOF') damit zsh keine Expansion macht.
-# Dateipfade via Umgebungsvariablen übergeben.
+  # Quelle 2: superlange Einzelzeilen (kein \n, aber >= LONG_THRESH Zeichen)
+  LC_ALL=C grep -v '\\n.*\\n' "${MERGED_DUMP}" \
+    | LC_ALL=C awk -v thresh="${LONG_THRESH}" 'length >= thresh' \
+    | LC_ALL=C sed \
+        -e 's/^[[:space:]]*[0-9]*[[:space:]]*//' \
+        -e 's/^: [0-9]*:[0-9]*;//' \
+    | LC_ALL=C tr '\n' '\0' \
+    >> "${BLOCKS_RAW}.raw0" 2>/dev/null || true
+
+else
+  # SIMPLE-Format: Python gruppiert Backslash-Continuation-Blöcke
+  # und schreibt Einzelzeilen direkt in SINGLES_FILE
+  export _MERGED_IN="${MERGED_DUMP}"
+  export _BLOCKS_OUT="${BLOCKS_RAW}.raw0"
+  export _SINGLES_OUT="${SINGLES_FILE}"
+  export _LONG_THRESH="${LONG_THRESH}"
+
+  python3 << 'PYEOF_SIMPLE'
+import os, sys
+
+merged_in   = os.environ['_MERGED_IN']
+blocks_out  = os.environ['_BLOCKS_OUT']
+singles_out = os.environ['_SINGLES_OUT']
+long_thresh = int(os.environ['_LONG_THRESH'])
+
+# Normalisierungs-Hilfsfunktion: führende Zeilennummern / Timestamp-Präfixe entfernen
+import re
+def strip_prefix(line):
+    line = re.sub(r'^: \d+:\d+;', '', line)
+    line = re.sub(r'^\s*\d+\s+', '', line)
+    return line
+
+try:
+    raw_lines = open(merged_in, encoding='utf-8', errors='replace').readlines()
+except Exception as e:
+    sys.exit(0)
+
+blocks  = []   # Liste von Strings (mehrzeilige Blöcke, NUL-getrennt)
+singles = []   # Einzelzeilen
+
+i = 0
+while i < len(raw_lines):
+    line = raw_lines[i].rstrip('\n')
+    stripped = strip_prefix(line)
+
+    if stripped.endswith('\\'):
+        # Backslash-Continuation: sammle alle folgenden Zeilen
+        block_lines = [stripped]
+        i += 1
+        while i < len(raw_lines):
+            nxt = raw_lines[i].rstrip('\n')
+            nxt_stripped = strip_prefix(nxt)
+            block_lines.append(nxt_stripped)
+            i += 1
+            if not nxt_stripped.endswith('\\'):
+                break
+        blocks.append('\n'.join(block_lines))
+    else:
+        # Einzelzeile
+        if stripped and len(stripped) >= long_thresh:
+            blocks.append(stripped)   # lange Einzelzeile → Review in Schritt 5
+        elif stripped:
+            singles.append(stripped)
+        i += 1
+
+# Blöcke NUL-separiert schreiben
+with open(blocks_out, 'ab') as f:
+    for b in blocks:
+        f.write(b.encode('utf-8', errors='replace') + b'\x00')
+
+# Einzelzeilen schreiben (append, da Datei möglicherweise schon existiert)
+with open(singles_out, 'a', encoding='utf-8', errors='replace') as f:
+    for s in singles:
+        f.write(s + '\n')
+PYEOF_SIMPLE
+
+  unset _MERGED_IN _BLOCKS_OUT _SINGLES_OUT _LONG_THRESH
+fi
+
+# Python-Dedup über alle Blöcke (format-unabhängig)
 export _BLOCKS_RAW_IN="${BLOCKS_RAW}.raw0"
 export _BLOCKS_RAW_OUT="${BLOCKS_RAW}"
 BLOCK_COUNT=$(python3 << 'PYEOF_DEDUP'
@@ -288,29 +401,30 @@ rm -f "${BLOCKS_RAW}.raw0"
 echo "   ✓ Blöcke nach Dedup: ${BLOCK_COUNT}"
 
 # -----------------------------------------------------------------------------
-# SCHRITT 2c — Normalisierung Einzelzeilen
-# Nur kurze Einzelzeilen (< LONG_THRESH Zeichen) landen hier —
-# superlange werden bereits in Schritt 2b nach BLOCKS_RAW geleitet.
+# SCHRITT 2c — Normalisierung Einzelzeilen (nur EXTENDED-Modus)
+# Im SIMPLE-Modus hat Python die Einzelzeilen bereits in SINGLES_FILE geschrieben.
+# Im EXTENDED-Modus lesen wir sie hier aus dem Dump.
 # -----------------------------------------------------------------------------
-echo "   → Normalisierung Einzelzeilen..."
+if [[ "${HIST_FORMAT}" == "EXTENDED" ]]; then
+  echo "   → Normalisierung Einzelzeilen (EXTENDED)..."
 
-LC_ALL=C grep -v '\\n.*\\n' "${MERGED_DUMP}" \
-  | LC_ALL=C awk -v thresh="${LONG_THRESH}" 'length < thresh' \
-  | LC_ALL=C sed -e 's/\\n$//' -e 's/\\n/\n/g' \
-  | LC_ALL=C awk '
-    /^[[:space:]]*$/  { next }
-    /^[[:space:]]+[0-9]+[[:space:]]/ {
-      sub(/^[[:space:]]+[0-9]+[[:space:]]+/, "")
-      if ($0 == "") next
-    }
-    /^: [0-9]+:[0-9]+;/ {
-      sub(/^: [0-9]+:[0-9]+;/, "")
-      if ($0 == "") next
-    }
-    /^\[200~/ { next }
-    { print }
-  ' \
-  | python3 -c "
+  LC_ALL=C grep -v '\\n.*\\n' "${MERGED_DUMP}" \
+    | LC_ALL=C awk -v thresh="${LONG_THRESH}" 'length < thresh' \
+    | LC_ALL=C sed -e 's/\\n$//' -e 's/\\n/\n/g' \
+    | LC_ALL=C awk '
+      /^[[:space:]]*$/  { next }
+      /^[[:space:]]+[0-9]+[[:space:]]/ {
+        sub(/^[[:space:]]+[0-9]+[[:space:]]+/, "")
+        if ($0 == "") next
+      }
+      /^: [0-9]+:[0-9]+;/ {
+        sub(/^: [0-9]+:[0-9]+;/, "")
+        if ($0 == "") next
+      }
+      /^\[200~/ { next }
+      { print }
+    ' \
+    | python3 -c "
 import sys, unicodedata
 for line in sys.stdin:
     s = line.rstrip('\n')
@@ -320,7 +434,11 @@ for line in sys.stdin:
     if all(cat in ('Mn','Cc','Cf','Zs','Zl','Zp') for cat in cats): continue
     if all(ord(c) < 0x20 or ord(c) == 0x7f for c in stripped): continue
     print(s)
-" 2>/dev/null > "${SINGLES_FILE}" || true
+" 2>/dev/null >> "${SINGLES_FILE}" || true
+
+else
+  echo "   → Einzelzeilen bereits durch Python normalisiert (SIMPLE)"
+fi
 
 SINGLES_COUNT=$(wc -l < "${SINGLES_FILE}" | tr -d ' ')
 echo "   ✓ Einzelzeilen: ${SINGLES_COUNT}"
