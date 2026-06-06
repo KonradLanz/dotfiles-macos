@@ -135,6 +135,18 @@ _cleanup_less_tmp() {
   [[ ${#files[@]} -gt 0 ]] && rm -f "${files[@]}"
 }
 
+# Alle /tmp-Dateien dieses Laufs entfernen — aufgerufen via trap und am Ende.
+_cleanup_all_tmp() {
+  rm -f "${MERGED_DUMP}" "${BLOCKS_RAW}" "${BLOCKS_RAW}.raw0" \
+        "${SINGLES_FILE}" "${CLEAN_FILE}" "${SECRET_FILE}" \
+        "${ENTRIES_TO_DELETE:-}" "${PENDING_BLOCKS_FILE}" \
+        "/tmp/zsh_hist_filtered_${TIMESTAMP}.txt"
+  _cleanup_less_tmp
+}
+
+# trap: bei unerwarteten Exits (Ctrl-C, Fehler, kill) aufräumen
+trap '_cleanup_all_tmp' EXIT INT TERM
+
 # -----------------------------------------------------------------------------
 # SCHRITT 0b — Checkpoint prüfen (Resume-Logik)
 # -----------------------------------------------------------------------------
@@ -711,6 +723,26 @@ except:
 }
 
 # -----------------------------------------------------------------------------
+# Hilfsfunktion: Datum für Script-Header bestimmen
+# Bei EXTENDED: Unix-Timestamp aus dem ersten ": TS:0;"-Marker im Block extrahieren.
+# Bei SIMPLE oder wenn kein Timestamp gefunden: heutiges Datum.
+# -----------------------------------------------------------------------------
+_script_date() {
+  local block="$1"
+  if [[ "${HIST_FORMAT}" == "EXTENDED" ]]; then
+    local ts
+    ts=$(printf '%s' "${block}" \
+      | LC_ALL=C grep -Eo '^: [0-9]+:[0-9]+;' \
+      | head -1 \
+      | LC_ALL=C sed 's/^: //;s/:[0-9]*;//')
+    if [[ -n "${ts}" && "${ts}" =~ ^[0-9]+$ ]]; then
+      date -r "${ts}" '+%Y-%m-%d' 2>/dev/null && return
+    fi
+  fi
+  date '+%Y-%m-%d'
+}
+
+# -----------------------------------------------------------------------------
 # SCHRITT 5 — Interaktive Block-Extraktion
 # -----------------------------------------------------------------------------
 touch "${PENDING_BLOCKS_FILE}"
@@ -826,8 +858,10 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
             echo "   [DRY-RUN] Würde speichern: ${SPATH}"
             echo "   [DRY-RUN] History-Eintrag: cat ${SPATH}  # → zsh zum Ausführen"
           else
+            local _extracted_date
+            _extracted_date=$(_script_date "${BLOCK_RAW}")
             printf '#!/usr/bin/env zsh\n# Extracted: %s\n# From: zsh history cleanup\n# ---\n\n%s\n' \
-              "$(date '+%Y-%m-%d %H:%M')" "${BLOCK_DISPLAY}" > "${SPATH}"
+              "${_extracted_date}" "${BLOCK_DISPLAY}" > "${SPATH}"
             chmod +x "${SPATH}"
             git -C "${SCRIPTS_DIR}" add "${SNAME}" > /dev/null 2>&1 || true
             git -C "${SCRIPTS_DIR}" commit -m "extract: ${SNAME}" --quiet > /dev/null 2>&1 || true
@@ -934,10 +968,7 @@ METAEOF
     echo "║  Nächster Start: wird automatisch gefragt.         ║"
     echo "╚══════════════════════════════════════════════════════╝"
     echo ""
-    rm -f "${MERGED_DUMP}" "${BLOCKS_RAW}" "${BLOCKS_RAW}.raw0" \
-          "${SINGLES_FILE}" "${CLEAN_FILE}" "${SECRET_FILE}" \
-          "${PENDING_BLOCKS_FILE}"
-    _cleanup_less_tmp
+    # trap EXIT übernimmt das Cleanup — kein manuelles rm nötig
     exit 0
   fi
 
@@ -1041,12 +1072,7 @@ else
   echo "   ✓ ${HISTFILE} aktualisiert (${CLEAN_COUNT} Einträge)"
 fi
 
-rm -f "${MERGED_DUMP}" "${BLOCKS_RAW}" "${BLOCKS_RAW}.raw0" \
-      "${SINGLES_FILE}" "${CLEAN_FILE}" "${SECRET_FILE}" \
-      "${ENTRIES_TO_DELETE}" "${PENDING_BLOCKS_FILE}" \
-      "/tmp/zsh_hist_filtered_${TIMESTAMP}.txt"
-_cleanup_less_tmp
-
+# trap EXIT übernimmt das Cleanup aller /tmp-Dateien
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
 echo "║  ✅ Fertig!  Backup: ~/.zsh_history_backups/         ║"
