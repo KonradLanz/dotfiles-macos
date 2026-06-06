@@ -545,8 +545,7 @@ _derive_script_name() {
 # -----------------------------------------------------------------------------
 # LM Studio Namensvorschlag via lokale API
 #
-# - Repo-Namen aus dem Block werden automatisch erkannt und dem Prompt beigefügt
-# - Persönliche Details (Email, Name) fließen als Kontext ein
+# - Wird NACH der Block-Anzeige aufgerufen (parallel lesbar)
 # - Status auf /dev/tty (immer sichtbar, wird danach gelöscht)
 # - Fallback: _derive_script_name
 # -----------------------------------------------------------------------------
@@ -610,7 +609,7 @@ import sys, json, re
 try:
     data = json.load(sys.stdin)
     text = data['choices'][0]['message']['content'].strip()
-    token = re.split(r'[\s:,\"\x60\(\)]+', text.strip('\"\x60 '))[0]
+    token = re.split(r'[\s:,\"\`\(\)]+', text.strip('\"\` '))[0]
     token = re.sub(r'[^a-z0-9_-]', '_', token.lower()).strip('_')
     token = re.sub(r'_+', '_', token)[:50]
     print(token if len(token) >= 3 else '')
@@ -630,9 +629,9 @@ fi
 # SCHRITT 5 — Interaktive Block-Extraktion
 #
 # Ablauf pro Block:
-#   1. Block einlesen
-#   2. KI-Vorschlag holen (Status auf /dev/tty, danach gelöscht)
-#   3. Block-Header MIT Vorschlag anzeigen
+#   1. Block sofort anzeigen (ohne KI-Vorschlag — Platzhalter "…")
+#   2. KI-Vorschlag holen WÄHREND der User liest (Status auf /dev/tty)
+#   3. Vorschlag inline aktualisieren (eine Zeile überschreiben)
 #   4. Aktion wählen
 #   Bei [s]: Name editierbar vorausgefüllt (vared — zsh-nativ)
 #            Nach Speichern: "cat <script>  # → zsh zum Ausführen" in History
@@ -661,6 +660,8 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
       ${idx} ${total_blocks} ${total_lines} $(( from_line + 1 )) ${show_to}
     if [[ -n "${suggested}" ]]; then
       printf "   |  🏷  Vorschlag [%s]: %s\n" "${lm_source}" "${suggested}"
+    else
+      printf "   |  🏷  Vorschlag: wird geholt...\n"
     fi
     echo "   +----------------------------------------------------------+"
     printf '%s\n' "${display}" \
@@ -684,7 +685,14 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
 
     BLOCK_IDX=$(( BLOCK_IDX + 1 ))
 
-    # ── KI-Vorschlag holen (Status sichtbar auf /dev/tty) ──────────────────
+    # ── 1. Block SOFORT anzeigen (Vorschlag noch unbekannt) ────────────────
+    PREVIEW_FROM=0
+    _show_block_lines "${BLOCK_DISPLAY}" ${BLOCK_LINES} \
+      ${BLOCK_IDX} ${BLOCK_COUNT} ${PREVIEW_FROM} "" ""
+    PREVIEW_FROM=10
+    echo ""
+
+    # ── 2. KI-Vorschlag holen WÄHREND der User liest ───────────────────────
     LM_SUGGESTED=$(_lm_suggest_name "${BLOCK_DISPLAY}")
     if [[ -n "${LM_SUGGESTED}" ]]; then
       SUGGESTED="${LM_SUGGESTED}"
@@ -693,13 +701,9 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
       SUGGESTED=$(_derive_script_name "${BLOCK_RAW}")
       LM_SOURCE="lokal"
     fi
-    # ───────────────────────────────────────────────────────────────────────
 
-    PREVIEW_FROM=0
-    _show_block_lines "${BLOCK_DISPLAY}" ${BLOCK_LINES} \
-      ${BLOCK_IDX} ${BLOCK_COUNT} ${PREVIEW_FROM} "${SUGGESTED}" "${LM_SOURCE}"
-    PREVIEW_FROM=10
-    echo ""
+    # ── 3. Vorschlag nachträglich anzeigen (eine Zeile) ────────────────────
+    printf "   🏷  Vorschlag [%s]: %s\n\n" "${LM_SOURCE}" "${SUGGESTED}" > /dev/tty
 
     while true; do
       echo "   [s] Script  [i] Behalten  [d] Löschen  [m] +10 Zeilen  [M] less  [q] Stop"
