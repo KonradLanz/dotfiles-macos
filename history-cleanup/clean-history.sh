@@ -127,6 +127,14 @@ _display_line() {
   fi
 }
 
+# Alle /tmp/zsh_hist_less_TIMESTAMP_*.txt sicher löschen — (N)-Glob verhindert
+# "no matches found" wenn kein [M] aufgerufen wurde (set -e würde sonst abbrechen).
+_cleanup_less_tmp() {
+  local -a files
+  files=( /tmp/zsh_hist_less_${TIMESTAMP}_*(N) )
+  [[ ${#files[@]} -gt 0 ]] && rm -f "${files[@]}"
+}
+
 # -----------------------------------------------------------------------------
 # SCHRITT 0b — Checkpoint prüfen (Resume-Logik)
 # -----------------------------------------------------------------------------
@@ -136,7 +144,6 @@ _find_latest_checkpoint() {
   local -a candidates
   # (N) = null_glob: keine Fehlermeldung wenn nichts passt
   # (/) = nur Verzeichnisse
-  # ([1]) = erstes Element (nach Sort: alphabetisch = chronologisch wegen Timestamp)
   candidates=( "${BACKUP_DIR}"/checkpoint_*/(N/) )
   [[ ${#candidates[@]} -eq 0 ]] && { echo ""; return }
 
@@ -929,8 +936,8 @@ METAEOF
     echo ""
     rm -f "${MERGED_DUMP}" "${BLOCKS_RAW}" "${BLOCKS_RAW}.raw0" \
           "${SINGLES_FILE}" "${CLEAN_FILE}" "${SECRET_FILE}" \
-          "${PENDING_BLOCKS_FILE}" \
-          /tmp/zsh_hist_less_${TIMESTAMP}_*.txt 2>/dev/null || true
+          "${PENDING_BLOCKS_FILE}"
+    _cleanup_less_tmp
     exit 0
   fi
 
@@ -1037,8 +1044,8 @@ fi
 rm -f "${MERGED_DUMP}" "${BLOCKS_RAW}" "${BLOCKS_RAW}.raw0" \
       "${SINGLES_FILE}" "${CLEAN_FILE}" "${SECRET_FILE}" \
       "${ENTRIES_TO_DELETE}" "${PENDING_BLOCKS_FILE}" \
-      "/tmp/zsh_hist_filtered_${TIMESTAMP}.txt" \
-      /tmp/zsh_hist_less_${TIMESTAMP}_*.txt 2>/dev/null || true
+      "/tmp/zsh_hist_filtered_${TIMESTAMP}.txt"
+_cleanup_less_tmp
 
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
