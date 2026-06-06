@@ -26,7 +26,7 @@
 _SCRIPT_DIR="${${(%):-%x}:A:h}"
 if [[ -d "${_SCRIPT_DIR}/../.git" ]]; then
   echo "🔄 Schritt 0 — Auto-Pull..."
-  _PULL_OUT=$(git -C "${_SCRIPT_DIR}/.." pull --ff-only 2>&1)
+  _PULL_OUT=$(git -C "${_SCRIPT_DIR}/..\" pull --ff-only 2>&1)
   _PULL_RC=$?
   if [[ ${_PULL_RC} -eq 0 ]]; then
     echo "   ${_PULL_OUT}"
@@ -239,10 +239,18 @@ echo "   ✓ UTF-8 bereinigt"
 echo "   → History-Format erkennen..."
 
 TOTAL_LINES="${MERGED_COUNT}"
-EXTENDED_LINES=$(LC_ALL=C grep -c '^: [0-9][0-9]*:[0-9][0-9]*;' "${MERGED_DUMP}" 2>/dev/null || echo 0)
+
+# grep -c gibt auf macOS bei 0 Treffern exit 1 zurück — || true verhindert
+# Script-Abbruch (set -e). tr -d ' \n' entfernt führende Leerzeichen und
+# eventuelle Newlines die grep -c liefern kann.
+EXTENDED_LINES=$(LC_ALL=C grep -c '^: [0-9][0-9]*:[0-9][0-9]*;' "${MERGED_DUMP}" 2>/dev/null || true)
+EXTENDED_LINES=$(printf '%s' "${EXTENDED_LINES}" | tr -d ' \n\r\t')
+[[ -z "${EXTENDED_LINES}" || "${EXTENDED_LINES}" == *[!0-9]* ]] && EXTENDED_LINES=0
+
 EXTENDED_RATIO=0
-[[ "${TOTAL_LINES}" -gt 0 ]] && \
+if [[ "${TOTAL_LINES}" -gt 0 && "${EXTENDED_LINES}" -gt 0 ]]; then
   EXTENDED_RATIO=$(( EXTENDED_LINES * 100 / TOTAL_LINES ))
+fi
 
 if [[ "${EXTENDED_RATIO}" -ge 10 ]]; then
   HIST_FORMAT="EXTENDED"
