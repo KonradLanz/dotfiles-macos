@@ -1,0 +1,45 @@
+# =============================================================================
+# git/gitconfig — Versionierte Git-Konfiguration
+# =============================================================================
+# Einbinden via:
+#   git config --global include.path ~/git/dotfiles-macos/git/gitconfig
+#
+# Oder einmalig symlinken:
+#   ln -sf ~/git/dotfiles-macos/git/gitconfig ~/.gitconfig_dotfiles
+#   git config --global include.path ~/.gitconfig_dotfiles
+# =============================================================================
+
+[pull]
+	# Kein Merge-Commit beim Pull — immer rebase
+	# Verhindert "divergent branches"-Fehler
+	rebase = true
+
+[rebase]
+	# Beim Rebase automatisch gestashte Änderungen wieder anwenden
+	autostash = true
+
+[merge]
+	# Konflikte immer mit diff3-Stil (zeigt gemeinsamen Vorfahren)
+	conflictstyle = diff3
+
+[fetch]
+	# Veraltete remote-Tracking-Branches automatisch löschen
+	pruneRemoteBranches = true
+
+[push]
+	# Branch automatisch am remote anlegen wenn noch nicht vorhanden
+	autoSetupRemote = true
+
+[core]
+	# macOS: Dateinamen-Groß/Kleinschreibung beachten
+	ignorecase = false
+	# Keine CRLF-Konvertierung
+	autocrlf = false
+
+[diff]
+	# Bessere Diff-Darstellung für verschobene Zeilen
+	colorMoved = zebra
+
+[log]
+	# Datum im ISO-Format
+	date = iso
