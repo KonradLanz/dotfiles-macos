@@ -120,7 +120,7 @@ ask_edit() {
 _display_line() {
   local ln="$1" maxcols=${DISPLAY_MAX_COLS}
   if [[ ${#ln} -gt ${maxcols} ]]; then
-    printf "   | %s…  [2m(+%d Zeichen → [M] für vollen Inhalt)[0m\n" \
+    printf "   | %s…  \033[2m(+%d Zeichen → [M] für vollen Inhalt)\033[0m\n" \
       "${ln:0:${maxcols}}" $(( ${#ln} - maxcols ))
   else
     printf "   | %s\n" "${ln}"
@@ -130,13 +130,24 @@ _display_line() {
 # -----------------------------------------------------------------------------
 # SCHRITT 0b — Checkpoint prüfen (Resume-Logik)
 # -----------------------------------------------------------------------------
+# Neuesten gültigen Checkpoint finden — reines zsh-Glob, kein ls, kein Fehler
+# wenn das Verzeichnis leer / nicht existent ist.
 _find_latest_checkpoint() {
-  local latest
-  latest=$(ls -1d "${BACKUP_DIR}"/checkpoint_*/  2>/dev/null \
-    | sort | tail -1)
-  [[ -d "${latest}" && -f "${latest}/blocks.raw" \
-     && -f "${latest}/singles.txt" \
-     && -f "${latest}/meta.env" ]] && echo "${latest}" || echo ""
+  local -a candidates
+  # (N) = null_glob: keine Fehlermeldung wenn nichts passt
+  # (/) = nur Verzeichnisse
+  # ([1]) = erstes Element (nach Sort: alphabetisch = chronologisch wegen Timestamp)
+  candidates=( "${BACKUP_DIR}"/checkpoint_*/(N/) )
+  [[ ${#candidates[@]} -eq 0 ]] && { echo ""; return }
+
+  # Letztes (neuestes) Verzeichnis wählen
+  local latest="${candidates[-1]}"
+  # Vollständigkeit prüfen
+  if [[ -f "${latest}/blocks.raw" && -f "${latest}/singles.txt" && -f "${latest}/meta.env" ]]; then
+    echo "${latest}"
+  else
+    echo ""
+  fi
 }
 
 CHECKPOINT_DIR=$(_find_latest_checkpoint)
@@ -160,7 +171,6 @@ fi
 
 # Im Resume-Modus: direkt zu Schritt 5 springen
 if [[ -n "${RESUME_DIR}" ]]; then
-  # Dateien aus Checkpoint in temporäre Pfade kopieren
   cp "${RESUME_DIR}/blocks.raw"  "${BLOCKS_RAW}"
   cp "${RESUME_DIR}/singles.txt" "${SINGLES_FILE}"
   [[ -f "${RESUME_DIR}/secrets.txt" ]] && cp "${RESUME_DIR}/secrets.txt" "${SECRET_FILE}" \
@@ -768,7 +778,6 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
     printf "   🏷  Vorschlag [%s]: %s\n\n" "${LM_SOURCE}" "${SUGGESTED}" > /dev/tty
 
     while true; do
-      # [m] nur anbieten wenn noch mehr als die gezeigten Zeilen vorhanden sind
       if [[ ${BLOCK_LINES} -gt 10 && ${PREVIEW_FROM} -lt ${BLOCK_LINES} ]]; then
         echo "   [s] Script  [i] Behalten  [d] Löschen  [m] +10 Zeilen  [M] less  [p] Pause  [q] Stop"
       else
@@ -832,12 +841,9 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
           ;;
 
         p|P)
-          # ── Checkpoint speichern ────────────────────────────────────
-          # Verbleibende Blöcke (ab diesem, inklusiv) in Checkpoint schreiben
           local CP_DIR="${BACKUP_DIR}/checkpoint_${TIMESTAMP}"
           mkdir -p "${CP_DIR}"
 
-          # Aktuellen Block + alle noch nicht gelesenen Blöcke in neue .raw Datei
           {
             printf '%s\0' "${BLOCK_RAW}"
             while IFS= read -r -d $'\0' _REST_RAW <&3; do
@@ -846,11 +852,9 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
             done
           } > "${CP_DIR}/blocks.raw"
 
-          # Singles + Pending bisher
           cat "${SINGLES_FILE}" > "${CP_DIR}/singles.txt" 2>/dev/null || true
           [[ -f "${SECRET_FILE}" ]] && cp "${SECRET_FILE}" "${CP_DIR}/secrets.txt" || true
 
-          # Verbleibende Blöcke zählen
           local CP_REMAINING
           CP_REMAINING=$(python3 -c "
 import sys
@@ -858,7 +862,6 @@ data = open('${CP_DIR}/blocks.raw', 'rb').read()
 print(len([b for b in data.split(b'\x00') if b.strip()]))
 " 2>/dev/null || echo 0)
 
-          # Meta-Datei
           cat > "${CP_DIR}/meta.env" << METAEOF
 CHECKPOINT_DATE="$(date '+%Y-%m-%d %H:%M:%S')"
 CHECKPOINT_DONE=$(( BLOCK_IDX - 1 ))
@@ -875,11 +878,10 @@ METAEOF
           echo "   → Beim nächsten Start wird automatisch gefragt ob weitergemacht werden soll"
           echo ""
 
-          # Alten Checkpoint löschen falls vorhanden (nur den vorherigen)
           [[ -n "${RESUME_DIR}" && "${RESUME_DIR}" != "${CP_DIR}" ]] && \
             rm -rf "${RESUME_DIR}" 2>/dev/null || true
 
-          ABORT=2  # 2 = sauberer Pause-Exit
+          ABORT=2
           break 2
           ;;
 
@@ -907,7 +909,6 @@ METAEOF
   done
 
   if [[ ${ABORT} -eq 1 ]]; then
-    # [q] Stop: restliche Blöcke in Pending
     while IFS= read -r -d $'\0' BLOCK_RAW <&3; do
       [[ -z "${BLOCK_RAW// }" ]] && continue
       BLOCK_DISPLAY=$(printf '%s' "${BLOCK_RAW}" | LC_ALL=C sed 's/\\n/\n/g')
@@ -919,7 +920,6 @@ METAEOF
   set -e
 
   if [[ ${ABORT} -eq 2 ]]; then
-    # [p] Pause — sauber beenden, History NICHT ändern
     echo ""
     echo "╔══════════════════════════════════════════════════════╗"
     echo "║  ⏸️  Pause — Checkpoint gespeichert.                ║"
@@ -1004,7 +1004,6 @@ fi
 CLEAN_COUNT=$(wc -l < "${CLEAN_FILE}" | tr -d ' ')
 echo "   ✓ Bereinigt: ${CLEAN_COUNT} Einträge (war: ${MERGED_COUNT} Rohzeilen)"
 
-# Alten Checkpoint löschen da vollständig abgearbeitet
 [[ -n "${RESUME_DIR}" ]] && rm -rf "${RESUME_DIR}" 2>/dev/null && \
   echo "   ✓ Checkpoint gelöscht (vollständig abgearbeitet)" || true
 
