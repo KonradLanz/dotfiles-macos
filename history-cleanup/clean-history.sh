@@ -2,10 +2,33 @@
 # =============================================================================
 # clean-history.sh — ZSH History Cleanup + Multi-Line Block Extractor + Secret Detector
 # =============================================================================
+# Alias:
+#   hclean='zsh ~/git/dotfiles-macos/history-cleanup/clean-history.sh'
+#
+# Alias schnell auslesen:
+#   alias hclean
+#
+# In .zshrc eintragen (einmalig):
+#   echo "alias hclean='zsh ~/git/dotfiles-macos/history-cleanup/clean-history.sh'" >> ~/.zshrc
+#   source ~/.zshrc
+#
+# Alias sollte auch ins dotfiles-Repo (~/git/dotfiles-macos), z.B. in:
+#   ~/.config/zsh/aliases.zsh  oder  direkt in der .zshrc-Vorlage im Repo
+#
 # Usage:
+#   hclean
+#   hclean --dry-run
+#   hclean --skip-extract
 #   zsh ~/git/dotfiles-macos/history-cleanup/clean-history.sh
 #   zsh ~/git/dotfiles-macos/history-cleanup/clean-history.sh --dry-run
 #   zsh ~/git/dotfiles-macos/history-cleanup/clean-history.sh --skip-extract
+#
+# Logging:
+#   Jeder Lauf schreibt ein Log nach /tmp/hclean_YYYYMMDD_HHMMSS.log
+#   Pfad wird am Ende ausgegeben.
+#   Schnelle Analyse:
+#     grep "Zeilen\|Zeichen\|SCHRITT\|⚠️\|✓\|Backup\|Log" /tmp/hclean_*.log | tail -50
+#     cat /tmp/hclean_*.log | sort -t/ -k2 | tail -1   # neuestes Log
 #
 # Schritt 5 Aktionen:
 #   [s] Als Script speichern
@@ -27,6 +50,22 @@
 #   EXTENDED  ": TIMESTAMP:0;cmd\ncmd2"  — ZSH EXTENDED_HISTORY, \n-kodiert
 #   SIMPLE    "cmd"  (eine oder mehrere Zeilen, Backslash-Continuation möglich)
 # =============================================================================
+
+# -----------------------------------------------------------------------------
+# LOGGING
+# -----------------------------------------------------------------------------
+HCLEAN_LOG="${TMPDIR:-/tmp}/hclean_$(date +%Y%m%d_%H%M%S).log"
+
+_log() {
+  local msg="[$(date +%H:%M:%S)] $*"
+  echo "$msg"
+  echo "$msg" >> "$HCLEAN_LOG"
+}
+
+_log_only() {
+  # Nur ins Log schreiben, nicht auf stdout
+  echo "[$(date +%H:%M:%S)] $*" >> "$HCLEAN_LOG"
+}
 
 # -----------------------------------------------------------------------------
 # SCHRITT 0 — Auto-Pull (deaktiviert — zum Reaktivieren die Kommentare entfernen)
@@ -88,6 +127,9 @@ for arg in "$@"; do
   esac
 done
 
+_log "=== hclean gestartet ==="
+_log "Log: ${HCLEAN_LOG}"
+[[ "$DRY_RUN" == 1 ]] && _log "⚠️  DRY-RUN Modus: keine Änderungen werden gespeichert"
 [[ "$DRY_RUN" == 1 ]] && echo "⚠️  DRY-RUN Modus: keine Änderungen werden gespeichert"
 
 echo ""
@@ -176,6 +218,7 @@ if [[ -n "${CHECKPOINT_DIR}" ]]; then
   echo "   Gespeichert am: ${CHECKPOINT_DATE:-?}"
   echo "   Erledigt: ${CHECKPOINT_DONE:-?} Blöcke (Script:${CHECKPOINT_EXTRACTED:-0} Behalten:${CHECKPOINT_KEPT:-0} Gelöscht:${CHECKPOINT_DELETED:-0})"
   echo "   Verbleibend: ${CHECKPOINT_REMAINING:-?} Blöcke"
+  _log "Checkpoint gefunden: ${CHECKPOINT_DIR} — Erledigt: ${CHECKPOINT_DONE:-?}, Verbleibend: ${CHECKPOINT_REMAINING:-?}"
   ask CP_RESUME "   Dort weitermachen? [J/n] "
   if [[ "${CP_RESUME}" != "n" && "${CP_RESUME}" != "N" ]]; then
     RESUME_DIR="${CHECKPOINT_DIR}"
@@ -215,6 +258,7 @@ else
 # SCHRITT 1 — Terminal-Sessions analysieren
 # -----------------------------------------------------------------------------
 echo "📋 SCHRITT 1 — Terminal-Sessions (informativ)"
+_log "SCHRITT 1 — Terminal-Sessions analysieren"
 
 SESSION_FILES=(~/.zsh_sessions/*.historynew(N))
 SESSION_COUNT=${#SESSION_FILES[@]}
@@ -222,15 +266,19 @@ HAS_RAM_SESSIONS=0
 
 if [[ $SESSION_COUNT -eq 0 ]]; then
   echo "   ✓ Keine Session-Dateien gefunden"
+  _log "Keine Session-Dateien gefunden"
 else
   echo "   ℹ️  ${SESSION_COUNT} offene Terminal-Session(s):"
+  _log "${SESSION_COUNT} Terminal-Session(s) gefunden"
   for f in "${SESSION_FILES[@]}"; do
     count=$(wc -l < "$f" | tr -d ' ')
     if [[ $count -eq 0 ]]; then
       echo "      → $(basename $f)  [⚡ 0 Zeilen auf Disk — History liegt im RAM]"
+      _log "Session $(basename $f): 0 Zeilen auf Disk (RAM)"
       HAS_RAM_SESSIONS=1
     else
       echo "      → $(basename $f)  [$count Zeilen auf Disk]"
+      _log "Session $(basename $f): $count Zeilen auf Disk"
     fi
   done
   echo ""
@@ -259,6 +307,7 @@ echo ""
 
 fc -W 2>/dev/null && echo "   ✓ fc -W (dieses Terminal) ausgeführt" \
                   || echo "   ⚠️  fc -W (dieses Terminal) fehlgeschlagen — weiter"
+_log "fc -W (dieses Terminal) ausgeführt"
 
 echo ""
 echo "   ┌─────────────────────────────────────────────────────────┐"
@@ -302,10 +351,12 @@ APPLESCRIPT_EOF
   )
   if [[ "${APPLESCRIPT_RESULT}" == ERROR:* ]]; then
     echo "   ⚠️  AppleScript Fehler: ${APPLESCRIPT_RESULT#ERROR:}"
+    _log "⚠️  fc -W AppleScript Fehler: ${APPLESCRIPT_RESULT#ERROR:}"
   else
     SENT_N="${${APPLESCRIPT_RESULT#OK:}%%:*}"
     SKIPPED_N="${APPLESCRIPT_RESULT##*:}"
     echo "   ✓ fc -W gesendet an ${SENT_N} Tab(s)"
+    _log "fc -W gesendet an ${SENT_N} Tab(s), ${SKIPPED_N} übersprungen"
     [[ "${SKIPPED_N}" -gt 0 ]] && echo "   ℹ️  ${SKIPPED_N} Tab(s) übersprungen (busy)"
     if [[ "${SENT_N}" -gt 0 ]]; then
       echo "   ⏳ Warte 2s..."
@@ -314,6 +365,7 @@ APPLESCRIPT_EOF
   fi
 else
   echo "   → Andere Tabs übersprungen."
+  _log "fc -W an andere Tabs übersprungen"
 fi
 echo ""
 
@@ -322,21 +374,29 @@ echo ""
 # -----------------------------------------------------------------------------
 echo ""
 echo "💾 SCHRITT 2 — Backup & Merge"
+_log "SCHRITT 2 — Backup & Merge"
 mkdir -p "${BACKUP_DIR}"
 
 if [[ -f "${HISTFILE}" ]]; then
   cp "${HISTFILE}" "${BACKUP_DIR}/zsh_history.${TIMESTAMP}.bak"
+  _HISTFILE_LINES_BEFORE=$(wc -l < "${HISTFILE}" | tr -d ' ')
   echo "   ✓ Backup: ${BACKUP_DIR}/zsh_history.${TIMESTAMP}.bak"
+  _log "Backup erstellt: ${BACKUP_DIR}/zsh_history.${TIMESTAMP}.bak (${_HISTFILE_LINES_BEFORE} Zeilen)"
+  _log "Quelle: ${HISTFILE} — ${_HISTFILE_LINES_BEFORE} Zeilen"
+  _log "Längste Zeile in Quelle: $(awk '{ print length }' "${HISTFILE}" | sort -rn | head -1) Zeichen"
 else
   echo "   ℹ️  ${HISTFILE} existiert noch nicht"
+  _log "HISTFILE existiert nicht: ${HISTFILE}"
 fi
 
 # FIX: Session-Backups nur anlegen wenn die Datei nicht leer ist (-s)
 for f in ~/.zsh_sessions/*.history(N) ~/.zsh_sessions/*.historynew(N); do
-  [[ -f "$f" && -s "$f" ]] && cp "$f" "${BACKUP_DIR}/$(basename $f).${TIMESTAMP}.bak"
+  [[ -f "$f" && -s "$f" ]] && cp "$f" "${BACKUP_DIR}/$(basename $f).${TIMESTAMP}.bak" \
+    && _log "Session-Backup: $(basename $f) ($(wc -l < "$f" | tr -d ' ') Zeilen)"
 done
 
 echo "   → Merge..."
+_log "Merge startet..."
 fc -ln 1 > "${MERGED_DUMP}" 2>/dev/null || true
 for f in ~/.zsh_sessions/*.history(N) ~/.zsh_sessions/*.historynew(N); do
   [[ -f "$f" && -s "$f" ]] && cat "$f" >> "${MERGED_DUMP}" 2>/dev/null || true
@@ -345,16 +405,24 @@ done
 
 MERGED_COUNT=$(wc -l < "${MERGED_DUMP}" | tr -d ' ')
 echo "   ✓ Gesamt: ${MERGED_COUNT} Rohzeilen"
+_log "Merge: ${MERGED_COUNT} Rohzeilen gesamt"
 [[ "${MERGED_COUNT}" -eq 0 ]] && echo "   ❌ Keine Daten!" && exit 1
 
 iconv -f UTF-8 -t UTF-8 -c "${MERGED_DUMP}" > "${MERGED_DUMP}.utf8" 2>/dev/null && \
   mv "${MERGED_DUMP}.utf8" "${MERGED_DUMP}" || true
 echo "   ✓ UTF-8 bereinigt"
+_log "UTF-8 Bereinigung abgeschlossen"
+
+# Längste Zeile im Merge-Dump loggen (hilfreich zur Diagnose)
+_MAX_LEN_MERGED=$(awk '{ print length }' "${MERGED_DUMP}" | sort -rn | head -1)
+_log "Längste Zeile im Merge-Dump: ${_MAX_LEN_MERGED} Zeichen"
+_log "Zeilen > ${MAX_LINE_LEN} Zeichen im Merge-Dump: $(awk -v m="${MAX_LINE_LEN}" 'length > m' "${MERGED_DUMP}" | wc -l | tr -d ' ')"
 
 # -----------------------------------------------------------------------------
 # SCHRITT 2a — History-Format erkennen
 # -----------------------------------------------------------------------------
 echo "   → History-Format erkennen..."
+_log "SCHRITT 2a — History-Format erkennen"
 
 TOTAL_LINES="${MERGED_COUNT}"
 EXTENDED_LINES=$(LC_ALL=C grep -c '^: [0-9][0-9]*:[0-9][0-9]*;' "${MERGED_DUMP}" 2>/dev/null || true)
@@ -369,17 +437,20 @@ fi
 if [[ "${EXTENDED_RATIO}" -ge 10 ]]; then
   HIST_FORMAT="EXTENDED"
   echo "   ✓ Format: EXTENDED (Timestamps, ${EXTENDED_LINES} von ${TOTAL_LINES} Zeilen = ${EXTENDED_RATIO}%)"
-  echo "     → Multiline-Blöcke: \\n-kodiert auf einer Zeile"
+  echo "     → Multiline-Blöcke: \n-kodiert auf einer Zeile"
+  _log "Format: EXTENDED — ${EXTENDED_LINES}/${TOTAL_LINES} Zeilen = ${EXTENDED_RATIO}%"
 else
   HIST_FORMAT="SIMPLE"
   echo "   ✓ Format: SIMPLE (keine Timestamps, ${EXTENDED_LINES} von ${TOTAL_LINES} Zeilen = ${EXTENDED_RATIO}%)"
   echo "     → Multiline-Blöcke: echte Zeilenumbrüche + Backslash-Continuation"
+  _log "Format: SIMPLE — ${EXTENDED_LINES}/${TOTAL_LINES} Zeilen = ${EXTENDED_RATIO}%"
 fi
 
 # -----------------------------------------------------------------------------
 # SCHRITT 2b — Block-Erkennung + Dedup
 # -----------------------------------------------------------------------------
 echo "   → Blöcke erkennen (>= ${MIN_BLOCK_LINES} Zeilen, oder >= ${LONG_THRESH} Zeichen)..."
+_log "SCHRITT 2b — Block-Erkennung (MIN_BLOCK_LINES=${MIN_BLOCK_LINES}, LONG_THRESH=${LONG_THRESH})"
 
 touch "${BLOCKS_RAW}.raw0"
 
@@ -498,12 +569,14 @@ PYEOF_DEDUP
 unset _BLOCKS_RAW_IN _BLOCKS_RAW_OUT
 rm -f "${BLOCKS_RAW}.raw0"
 echo "   ✓ Blöcke nach Dedup: ${BLOCK_COUNT}"
+_log "Blöcke nach Dedup: ${BLOCK_COUNT}"
 
 # -----------------------------------------------------------------------------
 # SCHRITT 2c — Normalisierung Einzelzeilen
 # -----------------------------------------------------------------------------
 if [[ "${HIST_FORMAT}" == "EXTENDED" ]]; then
   echo "   → Normalisierung Einzelzeilen (EXTENDED)..."
+  _log "SCHRITT 2c — Normalisierung Einzelzeilen (EXTENDED)"
 
   LC_ALL=C grep -v '\\n.*\\n' "${MERGED_DUMP}" \
     | LC_ALL=C awk -v thresh="${LONG_THRESH}" 'length < thresh' \
@@ -535,16 +608,21 @@ for line in sys.stdin:
 
 else
   echo "   → Einzelzeilen bereits durch Python normalisiert (SIMPLE)"
+  _log "SCHRITT 2c — Einzelzeilen via Python normalisiert (SIMPLE)"
 fi
 
 SINGLES_COUNT=$(wc -l < "${SINGLES_FILE}" | tr -d ' ')
 echo "   ✓ Einzelzeilen: ${SINGLES_COUNT}"
+_log "Einzelzeilen nach Normalisierung: ${SINGLES_COUNT}"
+_log "Längste Einzelzeile in SINGLES_FILE: $(awk '{ print length }' "${SINGLES_FILE}" | sort -rn | head -1) Zeichen"
+_log "Einzelzeilen > ${MAX_LINE_LEN} Zeichen: $(awk -v m="${MAX_LINE_LEN}" 'length > m' "${SINGLES_FILE}" | wc -l | tr -d ' ')"
 
 # -----------------------------------------------------------------------------
 # SCHRITT 3 — Secret-Erkennung
 # -----------------------------------------------------------------------------
 echo ""
 echo "🔐 SCHRITT 3 — Secret-Erkennung"
+_log "SCHRITT 3 — Secret-Erkennung"
 
 export SINGLES_FILE
 python3 - << 'PYEOF' > "${SECRET_FILE}" 2>/dev/null
@@ -606,11 +684,14 @@ if [[ "${SECRET_COUNT}" -gt 0 ]]; then
   echo "   ----------------------------------------------------"
   head -20 "${SECRET_FILE}"
   echo "   ----------------------------------------------------"
+  _log "⚠️  ${SECRET_COUNT} potenzielle Secrets gefunden"
   ask SCONT "   Aus History entfernen? [J/n] "
   REMOVE_SECRETS="J"
   [[ "${SCONT}" == "n" || "${SCONT}" == "N" ]] && REMOVE_SECRETS="N"
+  _log "Secrets entfernen: ${REMOVE_SECRETS}"
 else
   echo "   ✓ Keine Secrets gefunden"
+  _log "Keine Secrets gefunden"
   REMOVE_SECRETS="N"
 fi
 
@@ -760,6 +841,7 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
   [[ "${DRY_RUN}" == 1 ]] && echo "   ⚠️  DRY-RUN: Aktionen simuliert, nichts geschrieben"
   echo "   Blöcke (nach Dedup): ${BLOCK_COUNT}  —  nicht entschiedene kommen in History"
   echo ""
+  _log "SCHRITT 5 — Block-Extraktion startet: ${BLOCK_COUNT} Blöcke"
 
   BLOCK_IDX=0
   EXTRACTED_COUNT=${CHECKPOINT_EXTRACTED:-0}
@@ -806,6 +888,8 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
     fi
 
     BLOCK_IDX=$(( BLOCK_IDX + 1 ))
+    _BLOCK_MAXLEN=$(printf '%s\n' "${BLOCK_DISPLAY}" | awk '{ print length }' | sort -rn | head -1)
+    _log "Block ${BLOCK_IDX}/${BLOCK_COUNT}: ${BLOCK_LINES} Zeilen, längste Zeile ${_BLOCK_MAXLEN} Zeichen"
 
     PREVIEW_FROM=0
     _show_block_lines "${BLOCK_DISPLAY}" ${BLOCK_LINES} \
@@ -865,6 +949,7 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
           if [[ "${DRY_RUN}" == 1 ]]; then
             echo "   [DRY-RUN] Würde speichern: ${SPATH}"
             echo "   [DRY-RUN] History-Eintrag: cat ${SPATH}  # → zsh zum Ausführen"
+            _log "Block ${BLOCK_IDX}: [DRY-RUN] Script → ${SPATH}"
           else
             local _extracted_date
             _extracted_date=$(_script_date "${BLOCK_RAW}")
@@ -876,6 +961,7 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
             echo "   ✓ Gespeichert: ${SPATH}"
             print -s "cat ${SPATH}  # → zsh ${SPATH} zum Ausführen"
             echo "   ✓ History: cat ${SPATH}  # → zsh ${SPATH} zum Ausführen"
+            _log "Block ${BLOCK_IDX}: Script gespeichert → ${SPATH} (${BLOCK_LINES} Zeilen)"
           fi
           EXTRACTED_COUNT=$(( EXTRACTED_COUNT + 1 ))
           echo ""
@@ -887,6 +973,7 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
             printf '%s\n' "${BLOCK_DISPLAY}" >> "${SINGLES_FILE}"
           fi
           echo "   → In History behalten"
+          _log "Block ${BLOCK_IDX}: In History behalten (${BLOCK_LINES} Zeilen)"
           KEPT_COUNT=$(( KEPT_COUNT + 1 ))
           echo ""
           break
@@ -894,6 +981,7 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
 
         d|D)
           echo "   → Gelöscht"
+          _log "Block ${BLOCK_IDX}: Gelöscht (${BLOCK_LINES} Zeilen)"
           DELETED_COUNT=$(( DELETED_COUNT + 1 ))
           echo ""
           break
@@ -922,7 +1010,7 @@ if [[ "${SKIP_EXTRACT}" == 0 && "${BLOCK_COUNT}" -gt 0 ]]; then
           CP_REMAINING=$(python3 -c "
 import sys
 data = open('${CP_DIR}/blocks.raw', 'rb').read()
-print(len([b for b in data.split(b'\x00') if b.strip()]))
+print(len([b for b in data.split(b'\\x00') if b.strip()]))
 " 2>/dev/null || echo 0)
 
           cat > "${CP_DIR}/meta.env" << METAEOF
@@ -940,6 +1028,7 @@ METAEOF
           echo "   ℹ️  Erledigt: $(( BLOCK_IDX - 1 ))  Verbleibend: ${CP_REMAINING}"
           echo "   → Beim nächsten Start wird automatisch gefragt ob weitergemacht werden soll"
           echo ""
+          _log "Pause — Checkpoint gespeichert: ${CP_DIR} (Erledigt: $(( BLOCK_IDX - 1 )), Verbleibend: ${CP_REMAINING})"
 
           [[ -n "${RESUME_DIR}" && "${RESUME_DIR}" != "${CP_DIR}" ]] && \
             rm -rf "${RESUME_DIR}" 2>/dev/null || true
@@ -953,6 +1042,7 @@ METAEOF
           ABORT=1
           echo "   → Stop — restliche Blöcke kommen unverändert in die History"
           echo ""
+          _log "Stop — restliche Blöcke in History"
           break 2
           ;;
 
@@ -961,6 +1051,7 @@ METAEOF
             printf '%s\n' "${BLOCK_DISPLAY}" >> "${SINGLES_FILE}"
           fi
           echo "   → In History behalten"
+          _log "Block ${BLOCK_IDX}: In History behalten (unbekannte Aktion '${ACTION}')"
           KEPT_COUNT=$(( KEPT_COUNT + 1 ))
           echo ""
           break
@@ -992,11 +1083,14 @@ METAEOF
     echo "║  Nächster Start: wird automatisch gefragt.         ║"
     echo "╚══════════════════════════════════════════════════════╝"
     echo ""
+    _log "=== hclean beendet (Pause/Checkpoint) ==="
+    _log "Log gespeichert: ${HCLEAN_LOG}"
     exit 0
   fi
 
   PENDING_COUNT=$(wc -l < "${PENDING_BLOCKS_FILE}" | tr -d ' ')
   echo "   ✓ Script: ${EXTRACTED_COUNT}  Löschen: ${DELETED_COUNT}  Behalten: ${KEPT_COUNT}  Pending: ${PENDING_COUNT} Zeilen"
+  _log "SCHRITT 5 fertig — Script: ${EXTRACTED_COUNT}  Löschen: ${DELETED_COUNT}  Behalten: ${KEPT_COUNT}  Pending-Zeilen: ${PENDING_COUNT}"
 
 else
   set +e
@@ -1008,8 +1102,10 @@ else
   done
   exec 3<&-
   set -e
-  [[ "${SKIP_EXTRACT}" == 1 ]] && echo "" && echo "   → Schritt 5 übersprungen — alle Blöcke in History"
-  [[ "${BLOCK_COUNT}" -eq 0 ]] && echo "" && echo "   ℹ️  Keine Blöcke >= ${MIN_BLOCK_LINES} Zeilen"
+  [[ "${SKIP_EXTRACT}" == 1 ]] && echo "" && echo "   → Schritt 5 übersprungen — alle Blöcke in History" \
+    && _log "SCHRITT 5 übersprungen (--skip-extract)"
+  [[ "${BLOCK_COUNT}" -eq 0 ]] && echo "" && echo "   ℹ️  Keine Blöcke >= ${MIN_BLOCK_LINES} Zeilen" \
+    && _log "Keine Blöcke >= ${MIN_BLOCK_LINES} Zeilen gefunden"
 fi
 
 # -----------------------------------------------------------------------------
@@ -1017,10 +1113,12 @@ fi
 # -----------------------------------------------------------------------------
 echo ""
 echo "🧹 SCHRITT 6 — History bereinigen"
+_log "SCHRITT 6 — Dedup + Secret-Entfernung + Longline-Filter"
 
 if [[ -s "${PENDING_BLOCKS_FILE}" ]]; then
   cat "${PENDING_BLOCKS_FILE}" >> "${SINGLES_FILE}"
   echo "   ℹ️  Pending-Blöcke eingemischt: $(wc -l < "${PENDING_BLOCKS_FILE}" | tr -d ' ') Zeilen"
+  _log "Pending-Blöcke eingemischt: $(wc -l < "${PENDING_BLOCKS_FILE}" | tr -d ' ') Zeilen"
 fi
 
 ENTRIES_TO_DELETE="/tmp/zsh_hist_delete_${TIMESTAMP}.txt"
@@ -1029,6 +1127,10 @@ touch "${ENTRIES_TO_DELETE}"
 
 [[ "${REMOVE_SECRETS}" == "J" ]] && \
   LC_ALL=C grep '^\[.*\] ' "${SECRET_FILE}" | LC_ALL=C sed 's/^\[.*\] //' >> "${ENTRIES_TO_DELETE}"
+
+_SINGLES_BEFORE_CLEAN=$(wc -l < "${SINGLES_FILE}" | tr -d ' ')
+_log "SINGLES_FILE vor awk-Bereinigung: ${_SINGLES_BEFORE_CLEAN} Zeilen"
+_log "Längste Zeile in SINGLES_FILE vor Bereinigung: $(awk '{ print length }' "${SINGLES_FILE}" | sort -rn | head -1) Zeichen"
 
 LC_ALL=C awk \
   -v maxlen="${MAX_LINE_LEN}" \
@@ -1054,8 +1156,15 @@ if [[ -s "${LONGLINES_BACKUP}" ]]; then
   LONGLINES_COUNT=$(wc -l < "${LONGLINES_BACKUP}" | tr -d ' ')
   echo "   ℹ️  ${LONGLINES_COUNT} sehr lange Zeilen (> ${MAX_LINE_LEN} Zeichen) gesichert:"
   echo "      → ${LONGLINES_BACKUP}"
+  _log "Sehr lange Zeilen (> ${MAX_LINE_LEN} Zeichen) gesichert: ${LONGLINES_COUNT} Zeilen → ${LONGLINES_BACKUP}"
+  # Log: die längsten Zeilen zur Analyse
+  _log "Top-5 längste Zeilen (Zeichenanzahl):"
+  awk '{ print length, substr($0,1,120) }' "${LONGLINES_BACKUP}" | sort -rn | head -5 | while IFS= read -r ln; do
+    _log_only "  LONGLINE: ${ln}"
+  done
 else
   rm -f "${LONGLINES_BACKUP}" 2>/dev/null || true
+  _log "Keine sehr langen Zeilen (> ${MAX_LINE_LEN} Zeichen) gefunden"
 fi
 
 if [[ -s "${ENTRIES_TO_DELETE}" ]]; then
@@ -1067,6 +1176,8 @@ fi
 
 CLEAN_COUNT=$(wc -l < "${CLEAN_FILE}" | tr -d ' ')
 echo "   ✓ Bereinigt: ${CLEAN_COUNT} Einträge (war: ${MERGED_COUNT} Rohzeilen)"
+_log "Bereinigt: ${CLEAN_COUNT} Einträge (Rohzeilen: ${MERGED_COUNT}, Einzelzeilen vor Clean: ${_SINGLES_BEFORE_CLEAN})"
+_log "Längste Zeile in CLEAN_FILE: $(awk '{ print length }' "${CLEAN_FILE}" | sort -rn | head -1) Zeichen"
 
 [[ -n "${RESUME_DIR}" ]] && rm -rf "${RESUME_DIR}" 2>/dev/null && \
   echo "   ✓ Checkpoint gelöscht (vollständig abgearbeitet)" || true
@@ -1076,16 +1187,19 @@ echo "   ✓ Bereinigt: ${CLEAN_COUNT} Einträge (war: ${MERGED_COUNT} Rohzeilen
 # -----------------------------------------------------------------------------
 echo ""
 echo "💿 SCHRITT 7 — History schreiben"
+_log "SCHRITT 7 — Schreiben nach ${HISTFILE}"
 
 if [[ "${DRY_RUN}" == 1 ]]; then
   echo "   [DRY-RUN] Würde ${CLEAN_COUNT} Einträge nach ${HISTFILE} schreiben"
   echo "   [DRY-RUN] Preview (letzte 10):"
   tail -10 "${CLEAN_FILE}" | sed 's/^/     /'
   echo "   [DRY-RUN] Keine Änderungen geschrieben."
+  _log "[DRY-RUN] ${CLEAN_COUNT} Einträge würden nach ${HISTFILE} geschrieben"
 else
   ask CONFIRM "   Jetzt ${CLEAN_COUNT} Einträge in ${HISTFILE} schreiben? [J/n] "
   if [[ "${CONFIRM}" == "n" || "${CONFIRM}" == "N" ]]; then
     echo "   → Abgebrochen. Backup: ${BACKUP_DIR}/"
+    _log "Schreiben abgebrochen durch Benutzer"
     exit 0
   fi
 
@@ -1093,13 +1207,16 @@ else
     [[ -f "$f" ]] && truncate -s 0 "$f" 2>/dev/null || true
   done
   echo "   ✓ Session-Dateien geleert"
+  _log "Session-Dateien geleert"
 
   cp "${CLEAN_FILE}" "${HISTFILE}"
   echo "   ✓ ${HISTFILE} aktualisiert (${CLEAN_COUNT} Einträge)"
+  _log "Schreibe ${CLEAN_COUNT} Einträge nach ${HISTFILE}"
 
   # fc -R in diesem Terminal sofort laden
   fc -R "${HISTFILE}" 2>/dev/null && echo "   ✓ fc -R (dieses Terminal) — History aktualisiert" \
                                   || echo "   ⚠️  fc -R fehlgeschlagen — manuell: fc -R ~/.zsh_history"
+  _log "fc -R ausgeführt"
 
   # fc -R an alle anderen idle Tabs senden
   echo ""
@@ -1140,10 +1257,12 @@ APPLESCRIPT_FCR
   if [[ "${FCR_RESULT}" == ERROR:* ]]; then
     echo "   ⚠️  fc -R AppleScript Fehler: ${FCR_RESULT#ERROR:}"
     echo "   → Manuell in anderen Tabs: fc -R ~/.zsh_history"
+    _log "⚠️  fc -R AppleScript Fehler: ${FCR_RESULT#ERROR:}"
   else
     FCR_SENT="${${FCR_RESULT#OK:}%%:*}"
     FCR_SKIPPED="${FCR_RESULT##*:}"
     echo "   ✓ fc -R gesendet an ${FCR_SENT} Tab(s)"
+    _log "fc -R gesendet an ${FCR_SENT} Tab(s), ${FCR_SKIPPED} übersprungen"
     [[ "${FCR_SKIPPED}" -gt 0 ]] && \
       echo "   ℹ️  ${FCR_SKIPPED} Tab(s) busy — dort manuell: fc -R ~/.zsh_history"
   fi
@@ -1158,6 +1277,7 @@ APPLESCRIPT_FCR
       && echo "   ✓ rdfind: ${_DELETED_DUPS} doppelte Backup(s) gelöscht" \
       || echo "   ✓ rdfind: keine Duplikate gefunden"
     rm -f "${BACKUP_DIR}/results.txt" 2>/dev/null || true
+    _log "rdfind: ${_DELETED_DUPS:-0} doppelte Backup(s) gelöscht"
   fi
 
   # FIX: Leere Dateien im Backup-Verzeichnis löschen (z.B. leere Session-Backups)
@@ -1165,6 +1285,7 @@ APPLESCRIPT_FCR
   if [[ "${_EMPTY_COUNT}" -gt 0 ]]; then
     find "${BACKUP_DIR}" -maxdepth 1 -type f -empty -delete 2>/dev/null || true
     echo "   ✓ ${_EMPTY_COUNT} leere Backup-Datei(en) gelöscht"
+    _log "${_EMPTY_COUNT} leere Backup-Datei(en) gelöscht"
   fi
 fi
 
@@ -1177,5 +1298,10 @@ if [[ "${DRY_RUN}" != 1 ]]; then
   echo "║  ✓ History bereits in allen Tabs geladen (fc -R)    ║"
   echo "║  ℹ️  Busy-Tabs: dort manuell fc -R ~/.zsh_history   ║"
 fi
+printf "║  📋 Log: %-43s║\n" "${HCLEAN_LOG}"
 echo "╚══════════════════════════════════════════════════════╝"
 echo ""
+
+_log "=== hclean fertig ==="
+_log "Zusammenfassung: Rohzeilen=${MERGED_COUNT} → Bereinigt=${CLEAN_COUNT}, Longlines gesichert=${LONGLINES_COUNT}, Secrets=${SECRET_COUNT}"
+_log "Log gespeichert: ${HCLEAN_LOG}"
