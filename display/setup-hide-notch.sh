@@ -141,22 +141,46 @@ mkdir -p "$BACKUP_DIR"
 success "Backup-Verzeichnis: $BACKUP_DIR"
 
 # Aktuelles Wallpaper sichern
-CURRENT_WALLPAPER=$(osascript -e 'tell application "Finder" to get POSIX path of (get desktop picture as alias)' 2>/dev/null || echo "")
-if [[ -n "$CURRENT_WALLPAPER" && -f "$CURRENT_WALLPAPER" ]]; then
-    TIMESTAMP=$(date '+%Y-%m-%d_%H-%M-%S')
-    BASENAME=$(basename "$CURRENT_WALLPAPER")
-    BACKUP_FILE="$BACKUP_DIR/wallpaper_${TIMESTAMP}_${BASENAME}.backup"
-    cp "$CURRENT_WALLPAPER" "$BACKUP_FILE"
-    echo "$CURRENT_WALLPAPER" > "${BACKUP_FILE}.path"
-    success "Wallpaper gesichert: $BACKUP_FILE"
-    info  "Originalpfad gespeichert: ${BACKUP_FILE}.path"
+# Wallpaper-Pfad via NSWorkspace (konsistent mit notch-black.swift)
+CURRENT_WALLPAPER=$(swift -e '
+import Cocoa
+if let url = NSWorkspace.shared.desktopImageURL(for: NSScreen.main!) {
+    print(url.path)
+}
+' 2>/dev/null || echo "")
+# Fallback: Finder (legacy, falls Swift-Inline nicht verfügbar)
+if [[ -z "$CURRENT_WALLPAPER" ]]; then
+    CURRENT_WALLPAPER=$(osascript -e 'tell application "Finder" to get POSIX path of (get desktop picture as alias)' 2>/dev/null || echo "")
+fi
 
-    # Maximal 10 Backups behalten
-    BACKUP_COUNT=$(ls "$BACKUP_DIR"/*.backup 2>/dev/null | wc -l | tr -d ' ')
-    if (( BACKUP_COUNT > 10 )); then
-        info "Bereinige alte Backups (behalte 10 neueste)..."
-        ls -t "$BACKUP_DIR"/*.backup | tail -n +11 | xargs -I{} sh -c 'rm "{}" "{}" .path 2>/dev/null || true'
-        success "Alte Backups bereinigt"
+if [[ -n "$CURRENT_WALLPAPER" && -f "$CURRENT_WALLPAPER" ]]; then
+    # Hash-Deduplizierung: kein Backup wenn Wallpaper identisch zum letzten
+    HASH_FILE="$BACKUP_DIR/.last_hash"
+    CURRENT_HASH=$(shasum -a 256 "$CURRENT_WALLPAPER" | awk '{print $1}')
+    LAST_HASH=$(cat "$HASH_FILE" 2>/dev/null || echo "")
+
+    if [[ "$CURRENT_HASH" == "$LAST_HASH" ]]; then
+        info "Wallpaper unverändert (Hash identisch) – kein neues Backup nötig"
+    else
+        TIMESTAMP=$(date '+%Y-%m-%d_%H-%M-%S')
+        BASENAME=$(basename "$CURRENT_WALLPAPER")
+        BACKUP_FILE="$BACKUP_DIR/wallpaper_${TIMESTAMP}_${BASENAME}.backup"
+        # APFS Clone: cp -c belegt keinen zusätzlichen Speicher (Copy-on-Write)
+        cp -c "$CURRENT_WALLPAPER" "$BACKUP_FILE"
+        echo "$CURRENT_WALLPAPER" > "${BACKUP_FILE}.path"
+        echo "$CURRENT_HASH" > "$HASH_FILE"
+        success "Wallpaper gesichert (APFS clone): $BACKUP_FILE"
+        info  "Originalpfad gespeichert: ${BACKUP_FILE}.path"
+
+        # Maximal 10 Backups behalten (ohne den .last_hash)
+        BACKUP_COUNT=$(ls "$BACKUP_DIR"/*.backup 2>/dev/null | wc -l | tr -d ' ')
+        if (( BACKUP_COUNT > 10 )); then
+            info "Bereinige alte Backups (behalte 10 neueste)..."
+            ls -t "$BACKUP_DIR"/*.backup | tail -n +11 | while IFS= read -r old; do
+                rm -f "$old" "${old}.path"
+            done
+            success "Alte Backups bereinigt"
+        fi
     fi
 else
     warn "Kein aktuelles Wallpaper gefunden – kein Backup erstellt"
