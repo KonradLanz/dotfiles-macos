@@ -72,7 +72,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     # LaunchAgent stoppen
     if launchctl list | grep -q "$LAUNCH_AGENT_LABEL" 2>/dev/null; then
         info "LaunchAgent stoppen..."
-        launchctl unload "$LAUNCH_AGENT_PLIST" 2>/dev/null || true
+        launchctl bootout gui/$(id -u) "$LAUNCH_AGENT_PLIST" 2>/dev/null || true
         success "LaunchAgent gestoppt"
     else
         info "LaunchAgent war nicht aktiv"
@@ -232,12 +232,10 @@ cat > "$LAUNCH_AGENT_PLIST" << EOF
 EOF
 success "LaunchAgent-Plist geschrieben"
 
-# LaunchAgent laden (neu laden falls schon vorhanden)
-if launchctl list | grep -q "$LAUNCH_AGENT_LABEL" 2>/dev/null; then
-    info "LaunchAgent neu laden..."
-    launchctl unload "$LAUNCH_AGENT_PLIST" 2>/dev/null || true
-fi
-launchctl load "$LAUNCH_AGENT_PLIST"
+# LaunchAgent laden (bootstrap API, kompatibel mit macOS 13+)
+# bootout ist idempotent: kein Fehler wenn nicht geladen
+launchctl bootout gui/$(id -u) "$LAUNCH_AGENT_PLIST" 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) "$LAUNCH_AGENT_PLIST"
 success "LaunchAgent geladen und gestartet"
 
 echo ""

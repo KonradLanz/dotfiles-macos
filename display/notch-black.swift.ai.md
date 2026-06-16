@@ -31,3 +31,5 @@ Runs as a persistent process (via LaunchAgent) that on startup reads the current
 - Stable: state-file anti-loop pattern, `safeAreaInsets.top` for notch height, aspect-fill geometry
 - Likely to change: wallpaper URL detection should be unified with `setup-hide-notch.sh` (currently uses different method — see TODO)
 - Resolved: `setup-hide-notch.sh` now uses inline Swift `NSWorkspace.desktopImageURL` as primary source (with `osascript/Finder` fallback) — both scripts now consistent
+- Fixed: `originalURL` typo → `originalWallpaperURL` (line 67, caused compile error)
+- Fixed: explicit `Double()` casts in `CGRect` fill call — Swift on macOS 26 resolved `-` operator ambiguously as `Duration` subtraction

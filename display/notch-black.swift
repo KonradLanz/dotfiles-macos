@@ -64,7 +64,7 @@ let menuBarHeight = ceil(notchPt * scaleFactor)  // physische Pixel, aufgerundet
 print("Screen (physisch): \(screenW) x \(screenH)")
 print("safeAreaInsets.top: \(notchPt)pt → \(menuBarHeight)px physisch")
 
-guard let originalImage = NSImage(contentsOf: originalURL),
+guard let originalImage = NSImage(contentsOf: originalWallpaperURL),
       let cgOriginal = originalImage.cgImage(forProposedRect: nil, context: nil, hints: nil)
 else { print("Bild laden fehlgeschlagen"); exit(1) }
 
@@ -108,7 +108,7 @@ let ctx = CGContext(
 
 ctx.draw(cgOriginal, in: CGRect(x: 0, y: 0, width: imgW, height: imgH))
 ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
-ctx.fill(CGRect(x: 0, y: visibleTopInImg - barHeightInImg, width: imgW, height: barHeightInImg))
+ctx.fill(CGRect(x: 0, y: visibleTopInImg - barHeightInImg, width: Double(imgW), height: Double(barHeightInImg)))
 
 guard let modifiedCG = ctx.makeImage() else { print("Bild rendern fehlgeschlagen"); exit(1) }
 

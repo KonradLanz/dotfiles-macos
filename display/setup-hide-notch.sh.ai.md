@@ -34,3 +34,4 @@ One-shot installer that backs up the current wallpaper, writes a LaunchAgent pli
 - Fixed: SHA256 hash deduplication via `.last_hash` — no backup created when wallpaper unchanged
 - Fixed: `cp -c` (APFS Copy-on-Write clone) instead of `cp` — backup is instant and costs zero extra bytes until modified
 - Fixed: backup cleanup loop now uses `while read` instead of broken `xargs … rm "{}" "{}" .path`
+- Fixed: `launchctl load/unload` → `launchctl bootstrap/bootout gui/$(id -u)` — required on macOS 13+ (old API returns I/O error 5)
