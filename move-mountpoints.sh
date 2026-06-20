@@ -37,11 +37,9 @@ CONFIG_SCAN_DIRS=(
     "${HOME}/Library/LaunchAgents"
 )
 
+# Populated dynamically in check_system_files() via glob — do not hardcode individual auto_* files
 SYSTEM_FILES_READONLY=(
     "/etc/fstab"
-    "/etc/auto_master"
-    "/etc/auto_direct"
-    "/etc/auto_home"
 )
 
 # =============================================================================
@@ -167,18 +165,35 @@ check_system_files() {
     log_header "Checking system-protected files"
     local needs_sudo=0
 
-    for sysfile in "${SYSTEM_FILES_READONLY[@]}"; do
+    # Build scan list: /etc/fstab + all /etc/auto_* files (covers custom maps like auto_nas)
+    local -a sysfiles=( "${SYSTEM_FILES_READONLY[@]}" )
+    for f in /etc/auto_*(N); do
+        sysfiles+=("${f}")
+    done
+
+    for sysfile in "${sysfiles[@]}"; do
         [[ ! -f "${sysfile}" ]] && continue
         if grep -qF "${OLD_PATH}" "${sysfile}" 2>/dev/null; then
             needs_sudo=1
-            log_warn "Old path found in ${sysfile} — requires manual update:"
-            log_warn "  sudo sed -i '' 's|${OLD_PATH}|${NEW_PATH}|g' ${sysfile}"
+            if [[ "${AUTO_SUDO:-0}" == "1" ]]; then
+                sudo /usr/bin/sed -i '' "s|${OLD_PATH}|${NEW_PATH}|g" "${sysfile}" && \
+                    log_ok "Updated (sudo): ${sysfile}" || \
+                    log_warn "sudo sed failed for ${sysfile} — update manually"
+            else
+                log_warn "Old path found in ${sysfile} — requires manual update:"
+                log_warn "  sudo sed -i '' 's|${OLD_PATH}|${NEW_PATH}|g' ${sysfile}"
+            fi
         fi
     done
 
     if [[ ${needs_sudo} -eq 1 ]]; then
-        log_warn "Run the above sudo commands manually, then restart automountd:"
-        log_warn "  sudo automount -vc"
+        if [[ "${AUTO_SUDO:-0}" != "1" ]]; then
+            log_warn "Run the above sudo commands manually, then restart automountd:"
+            log_warn "  sudo automount -vc"
+        else
+            log_info "Reloading AutoFS..."
+            sudo /usr/sbin/automount -vc
+        fi
     else
         log_info "No system file references found"
     fi
@@ -255,16 +270,28 @@ rollback() {
 # =============================================================================
 
 main() {
-    if [[ $# -ne 2 ]]; then
-        print "Usage: ${SCRIPT_NAME} <old_path> <new_path>"
+    # Parse optional flags
+    AUTO_SUDO=0
+    local -a posargs=()
+    for arg in "$@"; do
+        case "${arg}" in
+            --sudo) AUTO_SUDO=1 ;;
+            *)      posargs+=("${arg}") ;;
+        esac
+    done
+
+    if [[ ${#posargs[@]} -ne 2 ]]; then
+        print "Usage: ${SCRIPT_NAME} [--sudo] <old_path> <new_path>"
+        print "  --sudo   Automatically apply sudo updates to /etc/fstab and /etc/auto_*"
         print "Example: ${SCRIPT_NAME} ~/nw ~/git/nw"
+        print "Example: ${SCRIPT_NAME} --sudo ~/nw ~/git/nw"
         exit 1
     fi
 
     # Resolve old path (must exist)
-    OLD_PATH="$(cd "$1" 2>/dev/null && pwd)" || log_error "Source path does not exist: $1"
+    OLD_PATH="$(cd "${posargs[1]}" 2>/dev/null && pwd)" || log_error "Source path does not exist: ${posargs[1]}"
     # Expand ~ in new path (may not exist yet)
-    NEW_PATH="${${2}/#\~/${HOME}}"
+    NEW_PATH="${${posargs[2]}/#\~/${HOME}}"
 
     print "\n====================================================="
     print "  macOS Mountpoint Migration"
