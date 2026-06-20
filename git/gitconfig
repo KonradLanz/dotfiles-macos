@@ -30,6 +30,11 @@
 	# Branch automatisch am remote anlegen wenn noch nicht vorhanden
 	autoSetupRemote = true
 
+[credential]
+	# gh CLI als credential helper — korrekte Syntax: 'gh auth git-credential'
+	# NICHT 'gh credential helper' (veraltet/falsch, existiert nicht mehr)
+	helper = !gh auth git-credential
+
 [core]
 	# macOS: Dateinamen-Groß/Kleinschreibung beachten
 	ignorecase = false
