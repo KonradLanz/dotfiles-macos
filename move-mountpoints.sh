@@ -1,4 +1,6 @@
 #!/usr/bin/env zsh
+# Ensure standard macOS tool paths are available regardless of launch context
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin:${PATH}"
 # =============================================================================
 # move-mountpoints.sh - Safely migrate mountpoints on macOS with config updates
 # =============================================================================
@@ -67,14 +69,14 @@ create_backup() {
     local path="$1"
     [[ ! -f "${path}" ]] && return 0
     local backup_path="${BACKUP_DIR}/${DATE}${path}"
-    mkdir -p "$(dirname "${backup_path}")"
-    cp -p "${path}" "${backup_path}"
+    /bin/mkdir -p "$(/usr/bin/dirname "${backup_path}")"
+    /bin/cp -p "${path}" "${backup_path}"
     log_info "Backed up: ${path}"
 }
 
 backup_all_configs() {
     log_header "Creating backups"
-    mkdir -p "${BACKUP_DIR}/${DATE}"
+    /bin/mkdir -p "${BACKUP_DIR}/${DATE}"
 
     for f in "${CONFIG_SCAN_FILES[@]}"; do
         create_backup "${f}"
@@ -190,10 +192,10 @@ move_directory() {
     log_header "Moving directory"
     [[ ! -d "${OLD_PATH}" ]] && log_error "Source does not exist: ${OLD_PATH}"
 
-    local parent_dir="$(dirname "${NEW_PATH}")"
+    local parent_dir="$(/usr/bin/dirname "${NEW_PATH}")"
     if [[ ! -d "${parent_dir}" ]]; then
         log_info "Creating parent directory: ${parent_dir}"
-        mkdir -p "${parent_dir}"
+        /bin/mkdir -p "${parent_dir}"
     fi
 
     if [[ -d "${NEW_PATH}" ]]; then
