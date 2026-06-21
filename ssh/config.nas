@@ -34,6 +34,6 @@ Host nas-shell
     User admin
     IdentityFile ~/.ssh/id_nas
     IdentitiesOnly yes
-    RequestTTY yes
-    RemoteCommand bash
+    RequestTTY force
+    RemoteCommand bash -i
     ConnectTimeout 10
