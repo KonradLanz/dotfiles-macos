@@ -98,11 +98,12 @@ case "$action" in
 
         # Schritt 2: Einmaligen Deaktivierungs-Eintrag in rc.local schreiben
         # QNAP fuehrt /etc/rc.local nach jedem Boot aus
-        _nas_ssh "grep -q 'nas-console-mgmt-disable' /etc/rc.local 2>/dev/null || \
-            printf '\n# nas-console-mgmt-disable (einmalig nach Reboot)\n/sbin/setcfg -f /etc/config/uLinux.conf \"Console Mgmt\" \"Auto Launch\" FALSE\n' >> /etc/rc.local"
+        # Einfache Anfuehrungszeichen innerhalb SSH-Befehl vermeiden -> heredoc via stdin
+        _rc_snippet='/sbin/setcfg -f /etc/config/uLinux.conf "Console Mgmt" "Auto Launch" FALSE'
+        _nas_ssh "sh -c 'grep -q nas-console-mgmt-disable /etc/rc.local 2>/dev/null || echo ${_rc_snippet} >> /etc/rc.local'"
         printf 'rc.local: Deaktivierungs-Eintrag gesetzt.\n'
         printf '\nJetzt rebooten:\n'
-        printf '  ssh nas \'reboot\'\n'
+        printf '  ssh nas reboot\n'
         printf '\nNach Reboot: Auto Launch automatisch FALSE -- ssh nas-shell direkt bash.\n'
         ;;
 
