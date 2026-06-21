@@ -25,18 +25,23 @@ CFG_KEY="Auto Launch"
 action="${1:-status}"
 
 _nas_ssh() {
+    # stdout bleibt offen (Caller entscheidet ob er captured)
+    # stderr -> /dev/null damit SSH-Verbindungsmeldungen nicht stoeren
     ssh -i ~/.ssh/id_nas -o IdentitiesOnly=yes \
         -o StrictHostKeyChecking=no \
+        -o LogLevel=QUIET \
         -o ConnectTimeout=10 \
         "${NAS_USER}@${NAS_HOST}" "$@"
 }
 
 _get_status() {
-    _nas_ssh "/sbin/getcfg -f '$CFG_FILE' '$CFG_SECTION' '$CFG_KEY'" 2>/dev/null
+    # Nur stdout captured, stderr via LogLevel=QUIET unterdrueckt
+    _nas_ssh "/sbin/getcfg -f '$CFG_FILE' '$CFG_SECTION' '$CFG_KEY'"
 }
 
 _set_status() {
-    _nas_ssh "/sbin/setcfg -f '$CFG_FILE' '$CFG_SECTION' '$CFG_KEY' '$1'" 2>/dev/null
+    # setcfg gibt nichts auf stdout aus -- wir zeigen NAS-stderr trotzdem
+    _nas_ssh "/sbin/setcfg -f '$CFG_FILE' '$CFG_SECTION' '$CFG_KEY' '$1' && echo 'setcfg OK'"
 }
 
 case "$action" in
