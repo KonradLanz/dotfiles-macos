@@ -44,3 +44,21 @@ gup() {
 # Kurzform ohne Commit-Nachricht
 alias gpull='git fetch origin && git rebase origin/$(git symbolic-ref --short HEAD)'
 alias gpush='git push origin $(git symbolic-ref --short HEAD)'
+
+# -----------------------------------------------------------------------------
+# NAS-Remotes — SSH-basierte git-Operationen gegen QNAP
+#
+# WICHTIG: Nur SSH fuer git pull/push verwenden.
+#          SMB-Mount (.../volumes/...) nur zum Browsen -- niemals git drauf.
+#
+# Einmalig Setup:    nas-setup
+# Status pruefen:    nas-status
+# Alle pullen:       nas-pull
+# Einen pullen:      nas-pull bootstrap-foundation
+# -----------------------------------------------------------------------------
+_NAS_REMOTES_SH="$HOME/git/dotfiles-macos/git/nas-remotes.sh"
+
+nas-setup()  { bash "$_NAS_REMOTES_SH" setup "$@"; }
+nas-status() { bash "$_NAS_REMOTES_SH" status "$@"; }
+nas-pull()   { bash "$_NAS_REMOTES_SH" pull "$@"; }
+nas-add()    { bash "$_NAS_REMOTES_SH" add "$@"; }
