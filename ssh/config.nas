@@ -25,14 +25,15 @@ Host nas
     ServerAliveCountMax 3
 
 # Interaktive Shell (ssh nas-shell)
-# QNAP zeigt bei interaktivem Login ein Q/Y-Menue das Shell-Typ abfragt.
-# Workaround: /bin/sh direkt aufrufen, QNAP-Login-Script ueberspringen.
-# Falls das Menue trotzdem erscheint: 'Q' dann Enter -> bash/sh
+# QNAP /etc/profile startet /sbin/qts-console-mgmt (Q/Y-Menue) wenn:
+#   - User=admin UND Auto Launch=TRUE UND Login-Shell
+# Fix: bash direkt aufrufen (kein Login-Flag), ueberspringt /etc/profile.
+# bash laedt nur ~/.bashrc (non-login interactive) -> kein qts-console-mgmt.
 Host nas-shell
     HostName nas.ad.own.dedyn.io
     User admin
     IdentityFile ~/.ssh/id_nas
     IdentitiesOnly yes
     RequestTTY yes
-    RemoteCommand /bin/sh
+    RemoteCommand bash
     ConnectTimeout 10
